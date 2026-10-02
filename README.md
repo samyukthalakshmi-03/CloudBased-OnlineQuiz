@@ -1,6 +1,6 @@
 # Cloud-Based Online Quiz Platform
 
-A cloud-native, serverless online quiz platform built for academia and certification testing as a **Cloud Computing Mini-Project**. The platform demonstrates how serverless cloud primitives—specifically **Firebase Authentication**, **Cloud Firestore NoSQL Database**, and **Firebase Hosting**—can be combined to deliver a secure, multi-tenant, role-based application with zero dedicated application server infrastructure.
+A cloud-native, serverless online quiz platform built for academia and certification testing as a **Cloud Computing Mini-Project**. The platform demonstrates how serverless cloud primitives—specifically **Firebase Authentication**, **Cloud Firestore NoSQL Database**, **Firebase Cloud Functions (Serverless Compute)**, and **Firebase Hosting**—can be combined to deliver a secure, multi-tenant, role-based application with zero dedicated application server infrastructure.
 
 ---
 
@@ -13,10 +13,11 @@ The Cloud-Based Online Quiz Platform enables educational institutions to conduct
   * Real-time listing of active, published quizzes.
   * Quiz attempt engine with synchronized countdown timer.
   * Automatic submission upon timer expiration.
-  * Instant score computation and answer breakdown.
+  * **Secure server-side score computation via Firebase Cloud Functions**.
+  * Instant score summary and authorized post-submission question review.
   * Past quiz attempt history with accuracy metrics.
   * Dynamic quiz leaderboards ranked by score and completion time.
-  * Client-side protection against duplicate quiz attempts.
+  * Multi-layer protection against duplicate attempts (deterministic result IDs & Firestore transactions).
 
 * **Faculty Capabilities:**
   * Dedicated faculty dashboard.
@@ -24,6 +25,7 @@ The Cloud-Based Online Quiz Platform enables educational institutions to conduct
   * Quiz draft/publish toggle.
   * Live quiz editing and deletion.
   * Student submission inspection with aggregate analytics (average score, highest score, lowest score).
+  * Isolated answer keys stored in restricted collections.
 
 ---
 
@@ -32,59 +34,87 @@ The Cloud-Based Online Quiz Platform enables educational institutions to conduct
 | Layer | Technology | Role & Architecture Rationale |
 | :--- | :--- | :--- |
 | **Frontend Framework** | React.js (v18) with Vite | Fast Single Page Application (SPA), component modularity |
-| **Language** | JavaScript (ESModules) | Native browser execution with modular Firebase SDK |
+| **Language** | JavaScript (ESModules / Node.js) | Native browser execution with modular Firebase SDK (v10) & Node.js 20 backend |
 | **Routing** | React Router DOM (v6) | Declarative client-side routing with role-based Route Guards |
 | **Styling** | Modular Modern CSS | Lightweight, zero-runtime dependency UI design |
 | **Identity & Access** | Firebase Authentication | Secure JWT-based cloud identity provider (Email/Password) |
-| **Cloud Database** | Cloud Firestore | Managed NoSQL document database with ACID guarantees & real-time updates |
+| **Cloud Database** | Cloud Firestore | Managed NoSQL document database with ACID transactions & real-time capabilities |
+| **Serverless Backend** | Firebase Cloud Functions (v2) | Trusted server-side grading, answer key isolation, and transaction management |
 | **Cloud Security** | Firestore Security Rules | Server-side declarative access control and authorization |
 | **Static Hosting** | Firebase Hosting | Global CDN hosting with SSL certificate and SPA rewrites |
+| **Local Emulation** | Firebase Emulator Suite | Local test harness for Auth, Firestore, and Cloud Functions |
 
 ---
 
-## 3. Cloud Architecture & Mini-Project Report Summary
+## 3. Why Server-Side Quiz Grading Is Needed
 
-### Academic Overview: Serverless Backend-as-a-Service (BaaS)
+### The Security Vulnerabilities of Client-Side Grading
+In client-side grading architectures, the browser application receives or fetches the answer key, computes the student's score in JavaScript, and writes the score directly to the database:
 
-Traditional web applications rely on a three-tier architecture (Client Tier, Application Server Tier, Database Tier) running on provisioned virtual machines or containers (IaaS/PaaS). 
+1. **Answer Key Exposure:** Storing correct answers in client-accessible Firestore collections allows students to inspect responses before submission using browser DevTools (Network tab, React state, or Firestore SDK queries).
+2. **Score Manipulation:** A malicious actor can modify JavaScript variables, mock the grading function, or alter the outgoing Firestore document payload to record arbitrary scores (e.g. 100% on any quiz).
+3. **Identity Spoofing:** A compromised client can transmit forged `studentId` or `facultyId` fields.
+4. **Race Conditions & Multiple Attempts:** Client-side checks cannot atomically guarantee single-attempt enforcement under concurrent network requests.
 
-This project implements a **Serverless Cloud Architecture (BaaS)**:
+### How Firebase Cloud Functions Solves This
+By migrating quiz grading to a callable Firebase Cloud Function (`submitQuiz`):
+
+* **Zero Answer Key Exposure:** Answer keys are stored in a restricted Firestore collection (`/quizAnswers`) completely blocked from student client-side reads. The Cloud Function fetches the answer key using the **Firebase Admin SDK** in an isolated environment.
+* **Authoritative Computation:** The server independently counts questions, calculates maximum marks from authoritative quiz data, validates selected choices, and computes earned scores. Client-supplied scores, marks, or user IDs are completely ignored.
+* **Verified Identity & Role:** The student UID is extracted directly from the verified Firebase Authentication JWT (`request.auth.uid`), and role verification ensures only registered students can submit.
+* **Atomic Deduplication:** A deterministic document ID (`${studentId}_${quizId}`) combined with a Firestore transaction (`runTransaction`) ensures that duplicate or concurrent submissions are rejected atomically.
+* **Immutable Results:** Firestore Security Rules permanently forbid client-side write operations (`create`, `update`, `delete`) to the `/results` collection. Only the trusted Cloud Function running with Admin SDK privileges can create result records.
+
+---
+
+## 4. Cloud Architecture
 
 ```
 +-------------------------------------------------------------------------+
 |                              CLIENT TIER                                |
 |   React SPA (Vite) running in the End-User Browser                      |
 |   - Modular Service Layer (authService, quizService, resultService)     |
-|   - Auth Context & Route Protection                                     |
-+--------------------+--------------------------------+-------------------+
-                     |                                |
-   Firebase Auth SDK |              Firestore SDK (v10)
-   (JWT Handshake)   |              (Encrypted TLS)
-                     v                                v
-+--------------------+--------+     +-----------------+-------------------+
-|     IDENTITY PROVIDER       |     |        CLOUD FIRESTORE              |
-|  Firebase Authentication    |     |  NoSQL Document Database            |
-|  - User Credentials         |     |  - /users (Profiles & Roles)        |
-|  - Token Issuance (ID/JWT)  |     |  - /quizzes (Sanitized Questions)   |
-|  - Session Persistence      |     |  - /quizAnswers (Restricted Keys)   |
-+--------------------+--------+     |  - /results (Immutable Records)    |
-                     |              +-----------------+-------------------+
-                     |                                ^
-                     +--------------------------------+
-                          Enforced at Database Layer:
-                          Firestore Security Rules Engine
+|   - Synchronized Timer & Question Selection                             |
++--------------------+---------------------+------------------------------+
+                     |                     |
+   Firebase Auth SDK |                     | Firebase Functions SDK (HTTPS Callable)
+   (JWT Handshake)   |                     | { quizId, answers, timeTaken }
+                     v                     v
++--------------------+--------+   +--------+------------------------------+
+|     IDENTITY PROVIDER       |   |          FIREBASE CLOUD FUNCTIONS     |
+|  Firebase Authentication    |   |  Node.js 20 Serverless Compute (v2)   |
+|  - User Credentials         |   |                                       |
+|  - Token Issuance (JWT)     |   |  submitQuiz:                          |
+|  - Verified request.auth    |   |  1. Validate auth token & student role|
++-----------------------------+   |  2. Load authoritative quiz & key    |
+                                  |  3. Validate option bounds & indices  |
+                                  |  4. Server-side score computation     |
+                                  |  5. Atomic transaction & deduplication|
+                                  |                                       |
+                                  |  getQuizReview:                       |
+                                  |  - Authorized question-by-question    |
+                                  |    review for completed attempts only |
+                                  +--------+------------------------------+
+                                           |
+                                           | Firebase Admin SDK (Privileged)
+                                           v
+                                  +--------+------------------------------+
+                                  |        CLOUD FIRESTORE                |
+                                  |  NoSQL Managed Database               |
+                                  |  - /users (Profiles & Roles)          |
+                                  |  - /quizzes (Sanitized Questions)     |
+                                  |  - /quizAnswers (Restricted Keys)     |
+                                  |  - /results (Server-Written Results)  |
+                                  |  - /leaderboards (Sanitized Rankings) |
+                                  +---------------------------------------+
+                                           ^
+                                           | Enforced at Database Gateway:
+                                           | Firestore Security Rules Engine
 ```
-
-### Key Cloud Characteristics Demonstrated:
-1. **On-Demand Self-Service:** Resources, authentication tokens, and database reads/writes scale automatically without provisioning servers.
-2. **Resource Pooling & Multi-Tenancy:** Handled transparently by Google Cloud's distributed infrastructure.
-3. **High Availability & Durability:** Firestore provides multi-region replication and 99.999% availability.
-4. **Zero Server Maintenance:** Eliminates patching, OS updates, and connection pool management.
-5. **Declarative Security at the Data Layer:** Security is decoupled from application servers and enforced at the database gateway using Firestore Security Rules.
 
 ---
 
-## 4. Database Schema (Cloud Firestore)
+## 5. Database Schema (Cloud Firestore)
 
 ### Collection: `users`
 * **Document ID**: Firebase Authentication UID (`request.auth.uid`)
@@ -99,11 +129,11 @@ This project implements a **Serverless Cloud Architecture (BaaS)**:
 
 ### Collection: `quizzes`
 * **Document ID**: Auto-generated (`quizId`)
-* **Note**: Contains sanitized question objects **omitting** `correctAnswer` to prevent client-side inspection by students during quiz attempts.
+* **Note**: Contains sanitized question objects **omitting** `correctAnswer` to prevent client-side inspection during quiz attempts.
 ```json
 {
   "title": "Cloud Computing Fundamentals",
-  "description": "Mid-term MCQ assessment on cloud models",
+  "description": "Assessment on cloud service and deployment models",
   "createdBy": "<faculty_uid>",
   "creatorEmail": "prof@university.edu",
   "duration": 20, // in minutes
@@ -125,7 +155,7 @@ This project implements a **Serverless Cloud Architecture (BaaS)**:
 
 ### Collection: `quizAnswers`
 * **Document ID**: Matches `quizId`
-* **Access Policy**: Faculty creator can always access; students can **only** read after an attempt record exists in `/results`.
+* **Access Policy**: **Faculty creator only**. Students are blocked from reading or writing this collection under all circumstances. Read access is mediated exclusively via the privileged `submitQuiz` and `getQuizReview` Cloud Functions.
 ```json
 {
   "quizId": "<quizId>",
@@ -143,6 +173,7 @@ This project implements a **Serverless Cloud Architecture (BaaS)**:
 
 ### Collection: `results`
 * **Document ID**: Deterministic `${studentId}_${quizId}` (enforces single submission)
+* **Access Policy**: **Read-only** for the student who submitted the attempt (`studentId == request.auth.uid`) or the faculty creator (`facultyId == request.auth.uid`). Client writes are permanently disabled (`allow write: if false;`).
 ```json
 {
   "studentId": "<student_uid>",
@@ -153,7 +184,7 @@ This project implements a **Serverless Cloud Architecture (BaaS)**:
   "quizTitle": "Cloud Computing Fundamentals",
   "score": 9,
   "totalMarks": 10,
-  "timeTaken": 420, // seconds
+  "timeTaken": 420, // in seconds
   "answers": {
     "0": 2,
     "1": 0
@@ -164,200 +195,258 @@ This project implements a **Serverless Cloud Architecture (BaaS)**:
 }
 ```
 
+### Collection: `leaderboards`
+* **Document ID**: Deterministic `${studentId}_${quizId}`
+* **Access Policy**: Public read for authenticated users. Writes are restricted to Firebase Admin SDK via the Cloud Function.
+* **Privacy Guarantee**: Omits student answers and personal email to protect student privacy.
+```json
+{
+  "studentId": "<student_uid>",
+  "studentName": "Jane Doe",
+  "facultyId": "<faculty_uid>",
+  "quizId": "<quizId>",
+  "score": 9,
+  "totalMarks": 10,
+  "timeTaken": 420,
+  "submittedAt": "Timestamp"
+}
+```
+
 ---
 
-## 5. Security Rules & Data Protection Strategy
+## 6. Security Rules & Access Control (`firestore.rules`)
 
-The project's security rules are implemented in `firestore.rules`.
+The platform's declarative security policies are enforced at the Firestore gateway:
 
-### Key Security Guarantees:
-1. **Strict Role Separation**:
-   * Only authenticated users with `getUserData().role == 'faculty'` can create, update, or delete quizzes.
-   * Faculty can only modify or delete quizzes where `resource.data.createdBy == request.auth.uid`.
-2. **Answers Key Isolation**:
-   * Students cannot query or inspect correct answers during a quiz.
-   * Rule for `/quizAnswers/{quizId}`:
-     ```javascript
+1. **Client-Side Result Write Lockout:**
+   Direct client creation, updates, and deletion of results are disabled:
+   ```javascript
+   match /results/{resultId} {
      allow read: if isAuthenticated() && (
-       (isFaculty() && resource.data.createdBy == request.auth.uid) ||
-       exists(/databases/$(database)/documents/results/$(request.auth.uid + '_' + quizId))
+       resource.data.studentId == request.auth.uid ||
+       (isFaculty() && resource.data.facultyId == request.auth.uid)
      );
-     ```
-3. **Role Immutability**:
-   * Rules prevent users from updating their own `role` field after creation (`request.resource.data.role == resource.data.role`).
-4. **Duplicate Submission Prevention**:
-   * Result document ID is deterministic (`${request.auth.uid}_${quizId}`).
-   * The rule strictly disallows creation if a document exists and allows update only once for score finalization (`completed: false -> completed: true`). Once `completed == true`, the record is locked permanently.
-5. **Delete Protection**:
-   * Result documents cannot be deleted (`allow delete: if false;`).
-
-### Architectural Note on Client-Side Scoring:
-> In this client-only academic prototype, scoring is calculated during submission and written to Firestore. While the isolated answer key and deterministic existence rules prevent students from viewing answers beforehand or modifying scores after submission, a production cloud deployment would utilize **Firebase Cloud Functions** (e.g. an `onCall` callable or `onDocumentCreated` trigger) to compute the score inside an isolated server-side environment. This limitation is intentional for the project scope and clearly documented.
+     allow create, update, delete: if false;
+   }
+   ```
+2. **Answer Key Protection:**
+   The `exists(...)` bypass has been eliminated. Students cannot query `/quizAnswers` even after completing an attempt:
+   ```javascript
+   match /quizAnswers/{quizId} {
+     allow read: if isFaculty() && resource.data.createdBy == request.auth.uid;
+     allow create: if isFaculty() && request.resource.data.createdBy == request.auth.uid;
+     allow update, delete: if isFaculty() && resource.data.createdBy == request.auth.uid;
+   }
+   ```
+3. **Role Immutability:**
+   Users can only select their role at registration and cannot update it thereafter:
+   ```javascript
+   allow update: if isOwner(userId) && request.resource.data.role == resource.data.role;
+   ```
+4. **Faculty Content Isolation:**
+   Faculty can only update or delete quizzes and answer keys matching their authenticated UID (`resource.data.createdBy == request.auth.uid`).
+5. **Sanitized Leaderboard Access:**
+   Authenticated users can read rankings from `/leaderboards` without accessing private submission documents:
+   ```javascript
+   match /leaderboards/{leaderboardId} {
+     allow read: if isAuthenticated();
+     allow write: if false;
+   }
+   ```
 
 ---
 
-## 6. Service Module Architecture
+## 7. Service Module Architecture
 
-All Firebase interaction is decoupled into clean, modular service functions:
+All Firebase interaction is decoupled into modular client service functions:
 
 * `src/services/authService.js`:
   * `registerUser(name, email, password, role)`: Registers auth user & creates Firestore profile doc.
-  * `loginUser(email, password)`: Firebase sign-in.
-  * `logoutUser()`: Firebase sign-out.
+  * `loginUser(email, password)`: Authenticates user credentials.
+  * `logoutUser()`: Signs out active session.
   * `getCurrentUser()`: Returns active Firebase Auth user.
   * `getUserProfile(uid)`: Retrieves profile document from `/users`.
-  * `onAuthChanged(callback)`: Persistent auth listener.
+  * `onAuthChanged(callback)`: Subscribes to auth state changes.
 
 * `src/services/quizService.js`:
   * `createQuiz(quizData)`: Saves sanitized quiz to `/quizzes` and answer key to `/quizAnswers`.
   * `updateQuiz(quizId, quizData)`: Updates quiz metadata and questions.
   * `deleteQuiz(quizId)`: Deletes quiz and answer key.
   * `getAvailableQuizzes()`: Queries published quizzes for students.
-  * `getQuizById(quizId)`: Returns sanitized quiz for students or complete quiz for faculty creator.
-  * `getFacultyQuizzes(facultyId)`: Returns all quizzes created by a faculty member.
+  * `getQuizById(quizId)`: Returns sanitized quiz for students, or complete quiz for faculty creator.
+  * `getFacultyQuizzes(facultyId)`: Returns quizzes created by a faculty member.
 
 * `src/services/resultService.js`:
-  * `submitQuiz(quizId, answers, timeTaken)`: Checks for duplicate attempts, records submission, grades against answer key, and finalizes score.
-  * `getResultById(resultId)`: Returns single submission.
-  * `getUserResults(userId)`: Returns all past attempts for a student.
-  * `getQuizResults(quizId)`: Returns all student attempts for a faculty's quiz.
-  * `getLeaderboard(quizId)`: Queries completed results, ranked by score descending and time taken ascending.
+  * `submitQuiz(quizId, studentAnswers, timeTaken)`: Calls the callable Cloud Function `submitQuiz` using Firebase Functions SDK.
+  * `getResultReview(quizId)`: Calls callable Cloud Function `getQuizReview` for authorized post-submission question review.
+  * `getResultById(resultId)`: Reads single result document by ID.
+  * `getUserResults(userId)`: Reads student attempt history (`studentId == request.auth.uid`).
+  * `getQuizResults(quizId)`: Reads submissions for a quiz (`facultyId == request.auth.uid`).
+  * `getLeaderboard(quizId)`: Reads rankings from the sanitized `/leaderboards` collection.
 
 ---
 
-## 7. Firebase Setup Instructions
+## 8. Firebase Functions Setup & Deployment
 
-Follow these steps in the [Firebase Console](https://console.firebase.google.com/):
+### Prerequisites & Billing Requirements
 
-### Step 1: Create a Firebase Project
-1. Go to the Firebase Console and click **Add project**.
-2. Name your project (e.g., `cloud-quiz-platform`).
-3. Google Analytics is optional; click **Create project**.
+> **Important on Firebase Billing Plan:**
+> Google Cloud Functions (2nd generation) requires the Firebase **Blaze (Pay as you go)** plan to build container images using Google Cloud Build and Artifact Registry. 
+> 
+> * **Zero Cost for Academic / Mini-Project Use:** The Blaze plan includes generous **free tier allowances** every month:
+>   * 2,000,000 Cloud Function invocations/month free.
+>   * 400,000 GB-seconds of compute time free.
+>   * 5 GB of egress networking free.
+>   * Firestore provides 50,000 reads and 20,000 writes/day free.
+> * For local development and testing, you can use the **Firebase Emulator Suite** completely offline on the **Spark (Free)** plan without entering billing information.
 
-### Step 2: Register a Web App
-1. On the Project Overview page, click the **Web** icon (`</>`).
-2. Enter an app nickname (e.g., `cloud-quiz-web`).
-3. (Optional) Check "Also set up Firebase Hosting".
-4. Click **Register app**. Firebase will display your `firebaseConfig` keys.
+### 1. Install Dependencies
 
-### Step 3: Enable Authentication
-1. In the left navigation, click **Build** -> **Authentication**.
-2. Click **Get Started**.
-3. Under the **Sign-in method** tab, enable **Email/Password** and click **Save**.
-
-### Step 4: Create Cloud Firestore Database
-1. In the left navigation, click **Build** -> **Firestore Database**.
-2. Click **Create database**.
-3. Choose your database location (e.g., `us-central1` or `asia-south1`).
-4. Select **Start in production mode** (or test mode; our `firestore.rules` will be deployed).
-5. Click **Create**.
-
-### Step 5: Deploy Firestore Security Rules
-1. In the Firestore console, click the **Rules** tab.
-2. Copy the entire contents of `firestore.rules` from this repository and paste it into the editor.
-3. Click **Publish**.
-
----
-
-## 8. Environment Variable Configuration
-
-1. In the project root directory, copy the example environment file:
-   ```bash
-   cp .env.example .env
-   ```
-2. Open `.env` and fill in the values from your Firebase Console (Project Settings -> General -> Your apps -> Web app):
-
-```env
-VITE_FIREBASE_API_KEY=AIzaSy...
-VITE_FIREBASE_AUTH_DOMAIN=cloud-quiz-xxxx.firebaseapp.com
-VITE_FIREBASE_PROJECT_ID=cloud-quiz-xxxx
-VITE_FIREBASE_STORAGE_BUCKET=cloud-quiz-xxxx.appspot.com
-VITE_FIREBASE_MESSAGING_SENDER_ID=123456789012
-VITE_FIREBASE_APP_ID=1:123456789012:web:abcdef...
-```
-
----
-
-## 9. Local Development Instructions
-
-### Prerequisites
-* Node.js v18 or higher (tested on Node v24)
-* npm v9 or higher
-
-### Install Dependencies
+Install root frontend dependencies:
 ```bash
 npm install
 ```
 
-### Start Development Server
+Install Cloud Functions backend dependencies:
 ```bash
-npm run dev
+cd functions
+npm install
+cd ..
 ```
-Open your browser at `http://localhost:3000`.
 
-### Build for Production
-```bash
-npm run build
-```
-The optimized static bundle will be built in the `dist/` directory.
+### 2. Configure Environment Variables
 
----
+1. Copy the example environment file:
+   ```bash
+   cp .env.example .env
+   ```
+2. Populate `.env` with credentials from your Firebase Console (**Project Settings -> General -> Your apps -> Web app**):
+   ```env
+   VITE_FIREBASE_API_KEY=AIzaSy...
+   VITE_FIREBASE_AUTH_DOMAIN=your-project-id.firebaseapp.com
+   VITE_FIREBASE_PROJECT_ID=your-project-id
+   VITE_FIREBASE_STORAGE_BUCKET=your-project-id.appspot.com
+   VITE_FIREBASE_MESSAGING_SENDER_ID=123456789012
+   VITE_FIREBASE_APP_ID=1:123456789012:web:abcdef...
+   VITE_USE_FIREBASE_EMULATOR=false
+   ```
 
-## 10. Firebase Deployment Instructions
+### 3. Local Development with Firebase Emulator Suite (Optional)
 
-To deploy your application to **Firebase Hosting**:
+The Firebase Emulator Suite allows you to run Auth, Firestore, and Cloud Functions locally without deploying to Google Cloud:
 
-1. Install the Firebase CLI globally:
+1. Install the Firebase CLI:
    ```bash
    npm install -g firebase-tools
    ```
-2. Log in to your Google/Firebase account:
+2. Start the emulators:
+   ```bash
+   firebase emulators:start
+   ```
+   The Emulator UI will be available at `http://localhost:4000`.
+3. Set `VITE_USE_FIREBASE_EMULATOR=true` in your `.env` file to direct client SDK calls to local ports (Auth: 9099, Firestore: 8080, Functions: 5001).
+4. Run the Vite development server:
+   ```bash
+   npm run dev
+   ```
+
+### 4. Deploying to Firebase
+
+1. **Log in to Firebase:**
    ```bash
    firebase login
    ```
-3. Initialize Firebase in the repository (if not already linked):
+2. **Associate with your Firebase Project:**
    ```bash
    firebase use --add
    ```
-   Select your Firebase Project ID.
-4. Build the production React app:
+   Select your project ID.
+3. **Build the React Frontend:**
    ```bash
    npm run build
    ```
-5. Deploy Firestore Security Rules and Hosting:
+4. **Deploy Cloud Functions:**
+   ```bash
+   firebase deploy --only functions
+   ```
+5. **Deploy Firestore Security Rules:**
+   ```bash
+   firebase deploy --only firestore:rules
+   ```
+6. **Deploy Everything (Functions, Firestore, Hosting):**
    ```bash
    firebase deploy
    ```
-6. Your platform will be live at:
-   `https://<your-project-id>.web.app`
 
 ---
 
-## 11. Testing & Demonstration Workflows
+## 9. Verification & Testing Workflows
 
-Execute the following testing sequence to demonstrate the platform for evaluation:
+### Test 1: Successful Server-Side Submission Flow
+1. **Faculty Setup:**
+   * Log in with a **Faculty** account.
+   * Create a quiz titled `"Cloud Quiz 1"` with 3 questions, valid options, marked answers, and publish it.
+2. **Student Submission:**
+   * Log in with a **Student** account in another browser or incognito window.
+   * Open `"Cloud Quiz 1"`, choose answers, and click **Submit Quiz Final Answers**.
+   * Observe the network tab: A POST request is dispatched to `https://us-central1-<project-id>.cloudfunctions.net/submitQuiz`.
+   * Result Summary: The score card displays the server-calculated score and accuracy percentage.
+   * Detailed Breakdown: The question review breakdown displays correct answers retrieved through `getQuizReview`.
+3. **Database Audit:**
+   * In the Firebase Console, verify that `/results/<uid>_<quizId>` exists with `completed: true`.
+   * Verify that `/leaderboards/<uid>_<quizId>` contains only public fields.
 
-1. **Faculty Onboarding & Quiz Creation**:
-   - Register an account with role **Faculty**.
-   - Navigate to **+ Create Quiz**.
-   - Create a quiz with 3 MCQ questions, assign options, select correct answers, and set duration (e.g. 5 minutes). Check "Publish immediately".
-   - Confirm quiz appears under **Faculty Dashboard**.
+### Test 2: Duplicate Attempt Rejection (Idempotency Test)
+1. Navigate back to `/quiz/<quizId>/attempt` in the browser.
+2. The UI immediately displays:
+   > *"Quiz Already Completed. You have already attempted and submitted this quiz."*
+3. If an adversary attempts to bypass the client and directly triggers the `submitQuiz` callable via the console, the server-side Firestore transaction detects the existing document and rejects the request with an `already-exists` (`functions/already-exists`) HttpsError.
 
-2. **Student Attempt & Timer Flow**:
-   - Log out or open an Incognito window.
-   - Register a second account with role **Student**.
-   - On the **Available Quizzes** dashboard, observe the newly created quiz.
-   - Click **Start Quiz**. Note the countdown timer in the header.
-   - Select answers and click **Submit Quiz Final Answers**.
+### Test 3: Direct Client Write Protection Test
+1. Open the browser Developer Console while logged in as a student.
+2. Execute a direct Firestore write attempting to forge or modify a score:
+   ```javascript
+   import { doc, setDoc } from 'firebase/firestore';
+   import { db, auth } from './src/firebase/config';
+   await setDoc(doc(db, 'results', `${auth.currentUser.uid}_fakeQuiz`), {
+     score: 100,
+     totalMarks: 100,
+     studentId: auth.currentUser.uid,
+     completed: true
+   });
+   ```
+3. Observe the result: The request is **immediately rejected** with:
+   `FirebaseError: Missing or insufficient permissions.`
 
-3. **Result Breakdown & Review**:
-   - Observe the score card showing total score, accuracy %, and time taken.
-   - Review each question: correctly answered questions are highlighted green; mistakes show your choice vs the correct answer.
+### Test 4: Answer Key Protection Test
+1. Log in as a student.
+2. Attempt to query the answer key collection via the browser console:
+   ```javascript
+   import { doc, getDoc } from 'firebase/firestore';
+   import { db } from './src/firebase/config';
+   await getDoc(doc(db, 'quizAnswers', '<quizId>'));
+   ```
+3. Observe the result: The read is **denied** with:
+   `FirebaseError: Missing or insufficient permissions.`
+   The answer key remains strictly inaccessible to student client queries at all times.
 
-4. **Duplicate Attempt Prevention**:
-   - Try navigating back to the quiz attempt URL.
-   - Verify that the platform detects the past attempt and blocks re-taking the quiz.
+### Test 5: Role & Validation Rejection Tests
+1. **Faculty attempting student submission:** Calling `submitQuiz` from a faculty account triggers a `permission-denied` HttpsError: *"Only registered students are permitted to submit quizzes."*
+2. **Unauthenticated request:** Calling `submitQuiz` without an active session triggers an `unauthenticated` HttpsError: *"Authentication required."*
+3. **Malformed answers:** Submitting invalid option indices (e.g. option `99` on a 4-choice question) triggers an `invalid-argument` HttpsError.
 
-5. **Leaderboard & Analytics Verification**:
-   - View the **Quiz Leaderboard** from the student dashboard and verify student ranking.
-   - Switch back to the faculty account, click **Submissions** for the quiz, and observe aggregate analytics (average score, highest score, submission log).
+---
+
+## 10. Summary of Modified & Created Files
+
+| File | Action | Purpose & Implementation Details |
+| :--- | :--- | :--- |
+| `functions/package.json` | **Created** | Configures Node.js 20 runtime, Firebase Functions v2 (`firebase-functions`), and Admin SDK (`firebase-admin`). |
+| `functions/index.js` | **Created** | Implements `submitQuiz` (authoritative server-side grading, role check, bounds validation, transactional deduplication) and `getQuizReview` (authorized post-submission review). |
+| `firebase.json` | **Modified** | Added `functions` source configuration and local `emulators` port mappings. |
+| `src/firebase/config.js` | **Modified** | Initialized and exported Firebase Functions SDK (`getFunctions(app)`) with optional emulator support. |
+| `src/services/resultService.js` | **Modified** | Replaced client grading and direct `results` writes with callable Cloud Function `submitQuiz`; added `getResultReview`; updated `getQuizResults` and `getLeaderboard` Firestore queries for rule compatibility. |
+| `src/pages/student/QuizResult.jsx` | **Modified** | Updated question breakdown to fetch authorized review data through `getResultReview` instead of direct `quizAnswers` reads. |
+| `firestore.rules` | **Modified** | Locked `/results` from client writes; locked `/quizAnswers` from student reads; restricted students to their own results; added `/leaderboards` rule. |
+| `.env.example` | **Modified** | Added optional `VITE_USE_FIREBASE_EMULATOR` configuration variable. |
+| `README.md` | **Modified** | Comprehensive documentation of server-side grading architecture, security rules, deployment, billing requirements, and test workflows. |

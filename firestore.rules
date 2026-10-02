@@ -33,7 +33,7 @@ service cloud.firestore {
       // Authenticated users can read profile data (e.g. for display names on leaderboards)
       allow read: if isAuthenticated();
 
-      // Users can only create their own user document
+      // Users can only create their own user document with valid initial role
       allow create: if isOwner(userId)
                     && request.resource.data.email == request.auth.token.email
                     && request.resource.data.role in ['student', 'faculty'];
@@ -68,48 +68,46 @@ service cloud.firestore {
     // ==========================================
     // 3. Quiz Answers Collection (Restricted)
     // Document ID: matches quizId
-    // Stores correct answers separately from student view
+    // Stores authoritative answer keys
+    // Inaccessible to students through client-side queries, even after submission
     // ==========================================
     match /quizAnswers/{quizId} {
-      // Faculty creator can always read;
-      // Students can ONLY read AFTER submitting their quiz result (verified by result doc existence)
-      allow read: if isAuthenticated() && (
-        (isFaculty() && resource.data.createdBy == request.auth.uid) ||
-        exists(/databases/$(database)/documents/results/$(request.auth.uid + '_' + quizId))
-      );
-
-      // Only faculty creator can create, update, or delete answers
+      // Only the faculty creator can read or manage their answer keys.
+      // Students CANNOT read quizAnswers directly via client Firestore queries.
+      allow read: if isFaculty() && resource.data.createdBy == request.auth.uid;
       allow create: if isFaculty() && request.resource.data.createdBy == request.auth.uid;
       allow update, delete: if isFaculty() && resource.data.createdBy == request.auth.uid;
     }
 
     // ==========================================
     // 4. Results Collection
-    // Document ID: deterministic `${studentId}_${quizId}` to prevent duplicate attempts
+    // Document ID: deterministic `${studentId}_${quizId}`
+    // Server-side grading only: All writes are performed via Firebase Admin SDK
     // ==========================================
     match /results/{resultId} {
-      // Students can read their own results;
-      // Faculty can read results for quizzes they created (stored in facultyId);
-      // Completed submissions allow read for public quiz leaderboard rankings
+      // Students can read only their own results;
+      // Faculty can read results associated with quizzes they created
       allow read: if isAuthenticated() && (
         resource.data.studentId == request.auth.uid ||
-        resource.data.facultyId == request.auth.uid ||
-        resource.data.completed == true
+        (isFaculty() && resource.data.facultyId == request.auth.uid)
       );
 
-      // Creation is allowed only once per student per quiz, enforcing UID matching
-      allow create: if isAuthenticated()
-                    && request.resource.data.studentId == request.auth.uid
-                    && resultId == request.auth.uid + '_' + request.resource.data.quizId;
+      // Students cannot directly create result documents.
+      // Students cannot modify scores or completed submissions.
+      // Only trusted server-side code (Firebase Admin SDK) can create and finalize results.
+      allow create, update, delete: if false;
+    }
 
-      // One-time finalization: once completed == true, subsequent updates are locked permanently
-      allow update: if isAuthenticated()
-                    && resource.data.studentId == request.auth.uid
-                    && resource.data.completed == false
-                    && request.resource.data.completed == true;
+    // ==========================================
+    // 5. Leaderboards Collection (Sanitized public entries)
+    // Document ID: deterministic `${studentId}_${quizId}`
+    // ==========================================
+    match /leaderboards/{leaderboardId} {
+      // Authenticated users can read sanitized leaderboard rankings
+      allow read: if isAuthenticated();
 
-      // Results are immutable and cannot be deleted
-      allow delete: if false;
+      // Only trusted server-side code (Firebase Admin SDK) can create, update, or delete entries
+      allow write: if false;
     }
   }
 }

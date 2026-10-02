@@ -1,9 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useLocation, Link } from 'react-router-dom';
-import { getResultById } from '../../services/resultService';
+import { getResultById, getResultReview } from '../../services/resultService';
 import { getQuizById } from '../../services/quizService';
-import { doc, getDoc } from 'firebase/firestore';
-import { db } from '../../firebase/config';
 import { useAuth } from '../../context/AuthContext';
 import LoadingSpinner from '../../components/LoadingSpinner';
 
@@ -45,15 +43,14 @@ export default function QuizResult() {
       const quizData = await getQuizById(quizId);
       setQuiz(quizData);
 
-      // 3. Fetch answer key now that submission exists
+      // 3. Fetch authorized answer key review breakdown via secure Cloud Function
       try {
-        const answerDocRef = doc(db, 'quizAnswers', quizId);
-        const answerSnap = await getDoc(answerDocRef);
-        if (answerSnap.exists()) {
-          setAnswerKey(answerSnap.data().answers || []);
+        const reviewData = await getResultReview(quizId);
+        if (reviewData && Array.isArray(reviewData.answerKey)) {
+          setAnswerKey(reviewData.answerKey);
         }
       } catch (err) {
-        console.warn('Could not load answer key breakdown:', err);
+        console.warn('[QuizResult] Could not load answer key breakdown:', err);
       }
     } catch (err) {
       console.error('Error loading result:', err);

@@ -1,24 +1,24 @@
 import {
   collection,
   doc,
-  setDoc,
   getDoc,
   getDocs,
-  updateDoc,
   query,
-  where,
-  serverTimestamp
+  where
 } from 'firebase/firestore';
-import { db, auth } from '../firebase/config';
+import { httpsCallable } from 'firebase/functions';
+import { db, auth, functions } from '../firebase/config';
 
 /**
- * Submit answers for a quiz.
+ * Submit answers for a quiz using secure server-side Cloud Function.
  * 
  * Flow:
- * 1. Checks if student has already submitted (deterministic result ID: `${uid}_${quizId}`).
- * 2. Writes an initial submission record with completed: false.
- * 3. Fetches the answer key from `/quizAnswers/{quizId}` (authorized by Firestore rule existence check).
- * 4. Calculates score and finalizes document with completed: true.
+ * 1. Validates that current user is authenticated.
+ * 2. Invokes callable Cloud Function 'submitQuiz' with quizId, studentAnswers, and timeTaken.
+ * 3. Server-side Cloud Function authenticates caller, verifies student role, grades
+ *    answers against restricted answer key, executes transactional duplicate prevention,
+ *    and writes finalized result and leaderboard entries.
+ * 4. Returns authoritative result summary without exposing answer key.
  * 
  * @param {string} quizId 
  * @param {object} studentAnswers - Map of { [questionIndex]: selectedOptionIndex }
@@ -34,87 +34,55 @@ export async function submitQuiz(quizId, studentAnswers, timeTaken) {
     throw new Error('Quiz ID is required.');
   }
 
-  const resultId = `${currentUser.uid}_${quizId}`;
-  const resultDocRef = doc(db, 'results', resultId);
-
-  // 1. Check for duplicate submission
   try {
-    const existingSnap = await getDoc(resultDocRef);
-    if (existingSnap.exists()) {
-      throw new Error('You have already submitted this quiz. Multiple attempts are not permitted.');
-    }
-  } catch (err) {
-    if (err.message.includes('Multiple attempts')) {
-      throw err;
-    }
-    // Proceed if document does not exist
+    const submitQuizFn = httpsCallable(functions, 'submitQuiz');
+    const response = await submitQuizFn({
+      quizId,
+      answers: studentAnswers || {},
+      timeTaken: Number(timeTaken) || 0
+    });
+
+    return response.data;
+  } catch (error) {
+    console.error('[resultService.submitQuiz] Cloud Function grading failed:', error);
+    // Extract clean error message from Firebase HttpsError
+    const message = error.message || 'Failed to submit quiz. Please try again.';
+    throw new Error(message);
+  }
+}
+
+/**
+ * Retrieve authorized quiz review data (correct answers & question breakdown).
+ * 
+ * Secure Cloud Function ensures that:
+ * - Only students with a completed submission or faculty creators can view the answer key.
+ * - Answer key is never exposed via direct client Firestore queries.
+ * 
+ * @param {string} quizId 
+ * @returns {Promise<{ quizId: string, answerKey: Array<{ questionIndex: number, correctAnswer: number, marks: number }> }>}
+ */
+export async function getResultReview(quizId) {
+  const currentUser = auth.currentUser;
+  if (!currentUser) {
+    throw new Error('You must be logged in to review quiz results.');
+  }
+  if (!quizId) {
+    throw new Error('Quiz ID is required.');
   }
 
-  // 2. Fetch quiz details
-  const quizDocRef = doc(db, 'quizzes', quizId);
-  const quizSnap = await getDoc(quizDocRef);
-  if (!quizSnap.exists()) {
-    throw new Error('Quiz not found or no longer available.');
-  }
-  const quizData = quizSnap.data();
-
-  // 3. Write initial result document (completed: false)
-  const initialData = {
-    studentId: currentUser.uid,
-    studentName: currentUser.displayName || 'Anonymous Student',
-    studentEmail: currentUser.email,
-    quizId: quizId,
-    quizTitle: quizData.title,
-    facultyId: quizData.createdBy,
-    totalMarks: quizData.totalMarks || 0,
-    answers: studentAnswers,
-    timeTaken: Number(timeTaken) || 0,
-    completed: false,
-    submittedAt: serverTimestamp()
-  };
-
-  await setDoc(resultDocRef, initialData);
-
-  // 4. Fetch the answer key now that submission record exists
-  let calculatedScore = 0;
-  let answerKey = [];
   try {
-    const answerDocRef = doc(db, 'quizAnswers', quizId);
-    const answerSnap = await getDoc(answerDocRef);
-    if (answerSnap.exists()) {
-      answerKey = answerSnap.data().answers || [];
-      answerKey.forEach((item) => {
-        const studentChoice = studentAnswers[item.questionIndex];
-        if (studentChoice !== undefined && Number(studentChoice) === Number(item.correctAnswer)) {
-          calculatedScore += Number(item.marks) || 1;
-        }
-      });
-    }
-  } catch (err) {
-    console.warn('[resultService.submitQuiz] Warning reading answer key:', err);
+    const getQuizReviewFn = httpsCallable(functions, 'getQuizReview');
+    const response = await getQuizReviewFn({ quizId });
+    return response.data;
+  } catch (error) {
+    console.error('[resultService.getResultReview] Error retrieving review breakdown:', error);
+    throw new Error(error.message || 'Failed to retrieve quiz review breakdown.');
   }
-
-  // 5. Finalize the result document (completed: true locks the document against edits)
-  await updateDoc(resultDocRef, {
-    score: calculatedScore,
-    completed: true,
-    finalizedAt: serverTimestamp()
-  });
-
-  return {
-    resultId,
-    quizId,
-    quizTitle: quizData.title,
-    score: calculatedScore,
-    totalMarks: quizData.totalMarks || 0,
-    timeTaken,
-    answers: studentAnswers,
-    answerKey
-  };
 }
 
 /**
  * Fetch a single result document by ID.
+ * Authorized for the student who submitted it or the faculty who created the quiz.
  * 
  * @param {string} resultId 
  * @returns {Promise<object | null>}
@@ -139,6 +107,9 @@ export async function getResultById(resultId) {
 
 /**
  * Get all past results for a specific student.
+ * 
+ * Compatible with Firestore security rules:
+ * resource.data.studentId == request.auth.uid
  * 
  * @param {string} userId 
  * @returns {Promise<Array<object>>}
@@ -175,6 +146,9 @@ export async function getUserResults(userId) {
 /**
  * Get all student submissions for a specific quiz (Faculty view).
  * 
+ * Compatible with Firestore security rules:
+ * isFaculty() && resource.data.facultyId == request.auth.uid
+ * 
  * @param {string} quizId 
  * @returns {Promise<Array<object>>}
  */
@@ -184,10 +158,14 @@ export async function getQuizResults(quizId) {
   }
 
   try {
+    const currentUser = auth.currentUser;
+    const facultyId = currentUser ? currentUser.uid : '';
+
     const resultsRef = collection(db, 'results');
     const q = query(
       resultsRef,
-      where('quizId', '==', quizId)
+      where('quizId', '==', quizId),
+      where('facultyId', '==', facultyId)
     );
     const snapshot = await getDocs(q);
 
@@ -212,6 +190,9 @@ export async function getQuizResults(quizId) {
 /**
  * Get public leaderboard rankings for a completed quiz.
  * 
+ * Queries sanitized public leaderboard collection to maintain student privacy
+ * while adhering to Firestore security rules.
+ * 
  * @param {string} quizId 
  * @returns {Promise<Array<object>>}
  */
@@ -221,35 +202,64 @@ export async function getLeaderboard(quizId) {
   }
 
   try {
-    const resultsRef = collection(db, 'results');
+    const leaderboardsRef = collection(db, 'leaderboards');
     const q = query(
-      resultsRef,
-      where('quizId', '==', quizId),
-      where('completed', '==', true)
+      leaderboardsRef,
+      where('quizId', '==', quizId)
     );
     const snapshot = await getDocs(q);
 
-    const leaderboard = snapshot.docs.map(docSnap => {
-      const data = docSnap.data();
-      return {
-        id: docSnap.id,
-        studentName: data.studentName || 'Student',
-        score: data.score || 0,
-        totalMarks: data.totalMarks || 0,
-        timeTaken: data.timeTaken || 0,
-        submittedAt: data.submittedAt
-      };
-    });
+    let entries = [];
+    if (!snapshot.empty) {
+      entries = snapshot.docs.map(docSnap => {
+        const data = docSnap.data();
+        return {
+          id: docSnap.id,
+          studentName: data.studentName || 'Student',
+          score: data.score || 0,
+          totalMarks: data.totalMarks || 0,
+          timeTaken: data.timeTaken || 0,
+          submittedAt: data.submittedAt
+        };
+      });
+    } else {
+      // Fallback for faculty creator: query results collection with facultyId constraint
+      const currentUser = auth.currentUser;
+      if (currentUser) {
+        try {
+          const resultsRef = collection(db, 'results');
+          const fallbackQ = query(
+            resultsRef,
+            where('quizId', '==', quizId),
+            where('facultyId', '==', currentUser.uid)
+          );
+          const fallbackSnap = await getDocs(fallbackQ);
+          entries = fallbackSnap.docs.map(docSnap => {
+            const data = docSnap.data();
+            return {
+              id: docSnap.id,
+              studentName: data.studentName || 'Student',
+              score: data.score || 0,
+              totalMarks: data.totalMarks || 0,
+              timeTaken: data.timeTaken || 0,
+              submittedAt: data.submittedAt
+            };
+          });
+        } catch {
+          // If fallback fails, return empty entries
+        }
+      }
+    }
 
     // Rank by score descending, then timeTaken ascending
-    leaderboard.sort((a, b) => {
+    entries.sort((a, b) => {
       if (b.score !== a.score) {
         return b.score - a.score;
       }
       return a.timeTaken - b.timeTaken;
     });
 
-    return leaderboard.map((item, index) => ({
+    return entries.map((item, index) => ({
       ...item,
       rank: index + 1
     }));
