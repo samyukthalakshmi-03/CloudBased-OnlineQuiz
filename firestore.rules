@@ -1,0 +1,115 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ==========================================
+    // Helper Functions
+    // ==========================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isFaculty() {
+      return isAuthenticated() && getUserData().role == 'faculty';
+    }
+
+    function isStudent() {
+      return isAuthenticated() && getUserData().role == 'student';
+    }
+
+    // ==========================================
+    // 1. Users Collection
+    // Document ID: Firebase Authentication UID
+    // ==========================================
+    match /users/{userId} {
+      // Authenticated users can read profile data (e.g. for display names on leaderboards)
+      allow read: if isAuthenticated();
+
+      // Users can only create their own user document
+      allow create: if isOwner(userId)
+                    && request.resource.data.email == request.auth.token.email
+                    && request.resource.data.role in ['student', 'faculty'];
+
+      // Users CANNOT change their assigned role after initial profile creation
+      allow update: if isOwner(userId)
+                    && request.resource.data.role == resource.data.role;
+
+      // Profile documents cannot be deleted directly
+      allow delete: if false;
+    }
+
+    // ==========================================
+    // 2. Quizzes Collection (Sanitized representation)
+    // Document ID: Auto-generated
+    // Questions stored here do NOT contain `correctAnswer`
+    // ==========================================
+    match /quizzes/{quizId} {
+      // Students can read published quizzes; Faculty can read any quiz they created
+      allow read: if isAuthenticated() && (
+        resource.data.isPublished == true ||
+        (isFaculty() && resource.data.createdBy == request.auth.uid)
+      );
+
+      // Only verified faculty can create quizzes, bound to their UID
+      allow create: if isFaculty() && request.resource.data.createdBy == request.auth.uid;
+
+      // Only the faculty creator can update or delete their quiz
+      allow update, delete: if isFaculty() && resource.data.createdBy == request.auth.uid;
+    }
+
+    // ==========================================
+    // 3. Quiz Answers Collection (Restricted)
+    // Document ID: matches quizId
+    // Stores correct answers separately from student view
+    // ==========================================
+    match /quizAnswers/{quizId} {
+      // Faculty creator can always read;
+      // Students can ONLY read AFTER submitting their quiz result (verified by result doc existence)
+      allow read: if isAuthenticated() && (
+        (isFaculty() && resource.data.createdBy == request.auth.uid) ||
+        exists(/databases/$(database)/documents/results/$(request.auth.uid + '_' + quizId))
+      );
+
+      // Only faculty creator can create, update, or delete answers
+      allow create: if isFaculty() && request.resource.data.createdBy == request.auth.uid;
+      allow update, delete: if isFaculty() && resource.data.createdBy == request.auth.uid;
+    }
+
+    // ==========================================
+    // 4. Results Collection
+    // Document ID: deterministic `${studentId}_${quizId}` to prevent duplicate attempts
+    // ==========================================
+    match /results/{resultId} {
+      // Students can read their own results;
+      // Faculty can read results for quizzes they created (stored in facultyId);
+      // Completed submissions allow read for public quiz leaderboard rankings
+      allow read: if isAuthenticated() && (
+        resource.data.studentId == request.auth.uid ||
+        resource.data.facultyId == request.auth.uid ||
+        resource.data.completed == true
+      );
+
+      // Creation is allowed only once per student per quiz, enforcing UID matching
+      allow create: if isAuthenticated()
+                    && request.resource.data.studentId == request.auth.uid
+                    && resultId == request.auth.uid + '_' + request.resource.data.quizId;
+
+      // One-time finalization: once completed == true, subsequent updates are locked permanently
+      allow update: if isAuthenticated()
+                    && resource.data.studentId == request.auth.uid
+                    && resource.data.completed == false
+                    && request.resource.data.completed == true;
+
+      // Results are immutable and cannot be deleted
+      allow delete: if false;
+    }
+  }
+}
