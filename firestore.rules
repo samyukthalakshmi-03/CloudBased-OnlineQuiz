@@ -1,113 +1,199 @@
+
 rules_version = '2';
+
 service cloud.firestore {
   match /databases/{database}/documents {
 
     // ==========================================
     // Helper Functions
     // ==========================================
+
     function isAuthenticated() {
       return request.auth != null;
     }
 
     function isOwner(userId) {
-      return isAuthenticated() && request.auth.uid == userId;
+      return isAuthenticated()
+        && request.auth.uid == userId;
+    }
+
+    function userExists(userId) {
+      return exists(
+        /databases/$(database)/documents/users/$(userId)
+      );
     }
 
     function getUserData() {
-      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      return get(
+        /databases/$(database)/documents/users/$(request.auth.uid)
+      ).data;
     }
 
     function isFaculty() {
-      return isAuthenticated() && getUserData().role == 'faculty';
+      return isAuthenticated()
+        && userExists(request.auth.uid)
+        && getUserData().role == 'faculty';
     }
 
     function isStudent() {
-      return isAuthenticated() && getUserData().role == 'student';
+      return isAuthenticated()
+        && userExists(request.auth.uid)
+        && getUserData().role == 'student';
     }
 
     // ==========================================
-    // 1. Users Collection
-    // Document ID: Firebase Authentication UID
+    // 1. Users
+    // Document ID = Firebase Authentication UID
     // ==========================================
+
     match /users/{userId} {
-      // Authenticated users can read profile data (e.g. for display names on leaderboards)
-      allow read: if isAuthenticated();
 
-      // Users can only create their own user document with valid initial role
+      // Users can read only their own profiles.
+      allow read: if isOwner(userId);
+
+      // Public registration can create student profiles only.
+      // Faculty profiles must be created by trusted
+      // administrative code using Firebase Admin SDK.
       allow create: if isOwner(userId)
-                    && request.resource.data.email == request.auth.token.email
-                    && request.resource.data.role in ['student', 'faculty'];
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.role == 'student'
+        && request.resource.data.keys().hasAll([
+          'email',
+          'role'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'name',
+          'email',
+          'role',
+          'createdAt'
+        ]);
 
-      // Users CANNOT change their assigned role after initial profile creation
+      // Users cannot change their email or role through
+      // Firestore profile updates.
       allow update: if isOwner(userId)
-                    && request.resource.data.role == resource.data.role;
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasOnly([
+            'name',
+            'displayName',
+            'photoURL'
+          ]);
 
-      // Profile documents cannot be deleted directly
+      // Clients cannot delete profiles directly.
       allow delete: if false;
     }
 
     // ==========================================
-    // 2. Quizzes Collection (Sanitized representation)
-    // Document ID: Auto-generated
-    // Questions stored here do NOT contain `correctAnswer`
+    // 2. Quizzes
+    // Public quiz documents must not contain answer keys.
     // ==========================================
+
     match /quizzes/{quizId} {
-      // Students can read published quizzes; Faculty can read any quiz they created
-      allow read: if isAuthenticated() && (
-        resource.data.isPublished == true ||
-        (isFaculty() && resource.data.createdBy == request.auth.uid)
-      );
 
-      // Only verified faculty can create quizzes, bound to their UID
-      allow create: if isFaculty() && request.resource.data.createdBy == request.auth.uid;
+      // Signed-in users can read published quizzes.
+      // Faculty can also read their own unpublished quizzes.
+      allow read: if isAuthenticated()
+        && (
+          resource.data.isPublished == true
+          || (
+            isFaculty()
+            && resource.data.createdBy == request.auth.uid
+          )
+        );
 
-      // Only the faculty creator can update or delete their quiz
-      allow update, delete: if isFaculty() && resource.data.createdBy == request.auth.uid;
+      // Only faculty can create quizzes under their own UID.
+      allow create: if isFaculty()
+        && request.resource.data.createdBy == request.auth.uid;
+
+      // Only the original faculty creator can update a quiz.
+      // Ownership cannot be transferred.
+      allow update: if isFaculty()
+        && resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdBy == resource.data.createdBy;
+
+      // Only the original faculty creator can delete a quiz.
+      allow delete: if isFaculty()
+        && resource.data.createdBy == request.auth.uid;
     }
 
     // ==========================================
-    // 3. Quiz Answers Collection (Restricted)
-    // Document ID: matches quizId
-    // Stores authoritative answer keys
-    // Inaccessible to students through client-side queries, even after submission
+    // 3. Quiz Answers
+    // Correct answers must not be exposed to students.
     // ==========================================
+
     match /quizAnswers/{quizId} {
-      // Only the faculty creator can read or manage their answer keys.
-      // Students CANNOT read quizAnswers directly via client Firestore queries.
-      allow read: if isFaculty() && resource.data.createdBy == request.auth.uid;
-      allow create: if isFaculty() && request.resource.data.createdBy == request.auth.uid;
-      allow update, delete: if isFaculty() && resource.data.createdBy == request.auth.uid;
+
+      // Only the faculty creator can read the answer key.
+      allow read: if isFaculty()
+        && resource.data.createdBy == request.auth.uid;
+
+      // Only faculty can create answer keys for their quizzes.
+      allow create: if isFaculty()
+        && request.resource.data.createdBy == request.auth.uid
+        && exists(
+          /databases/$(database)/documents/quizzes/$(quizId)
+        )
+        && get(
+          /databases/$(database)/documents/quizzes/$(quizId)
+        ).data.createdBy == request.auth.uid;
+
+      // Preserve answer-key ownership during updates.
+      allow update: if isFaculty()
+        && resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdBy == resource.data.createdBy
+        && exists(
+          /databases/$(database)/documents/quizzes/$(quizId)
+        )
+        && get(
+          /databases/$(database)/documents/quizzes/$(quizId)
+        ).data.createdBy == request.auth.uid;
+
+      allow delete: if isFaculty()
+        && resource.data.createdBy == request.auth.uid;
     }
 
     // ==========================================
-    // 4. Results Collection
-    // Document ID: deterministic `${studentId}_${quizId}`
-    // Server-side grading only: All writes are performed via Firebase Admin SDK
+    // 4. Results
+    // Results are written by trusted server-side code.
     // ==========================================
-    match /results/{resultId} {
-      // Students can read only their own results;
-      // Faculty can read results associated with quizzes they created
-      allow read: if isAuthenticated() && (
-        resource.data.studentId == request.auth.uid ||
-        (isFaculty() && resource.data.facultyId == request.auth.uid)
-      );
 
-      // Students cannot directly create result documents.
-      // Students cannot modify scores or completed submissions.
-      // Only trusted server-side code (Firebase Admin SDK) can create and finalize results.
+    match /results/{resultId} {
+
+      // Students can read their own results.
+      // Faculty can read results associated with their quizzes.
+      allow read: if isAuthenticated()
+        && (
+          resource.data.studentId == request.auth.uid
+          || (
+            isFaculty()
+            && resource.data.facultyId == request.auth.uid
+          )
+        );
+
+      // All client-side result writes are denied.
       allow create, update, delete: if false;
     }
 
     // ==========================================
-    // 5. Leaderboards Collection (Sanitized public entries)
-    // Document ID: deterministic `${studentId}_${quizId}`
+    // 5. Leaderboards
+    // Store only fields intended for leaderboard display.
     // ==========================================
+
     match /leaderboards/{leaderboardId} {
-      // Authenticated users can read sanitized leaderboard rankings
+
+      // Signed-in users can read leaderboard entries.
       allow read: if isAuthenticated();
 
-      // Only trusted server-side code (Firebase Admin SDK) can create, update, or delete entries
+      // Only trusted server-side code can write entries.
       allow write: if false;
     }
+
+    // ==========================================
+    // Default Deny
+    // Any document not explicitly allowed above is denied.
+    // ==========================================
+
   }
 }

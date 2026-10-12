@@ -1,128 +1,187 @@
+
 import {
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
   signOut,
   updateProfile,
+  deleteUser,
   onAuthStateChanged
 } from 'firebase/auth';
+
 import {
   doc,
   setDoc,
   getDoc,
   serverTimestamp
 } from 'firebase/firestore';
+
 import { auth, db } from '../firebase/config';
 
 /**
- * Register a new user with Firebase Authentication and create their profile in Cloud Firestore.
- * 
- * @param {string} name - Full name of the user
- * @param {string} email - Email address
- * @param {string} password - Minimum 6-character password
- * @param {'student'|'faculty'} role - Designated role
- * @returns {Promise<{ uid: string, email: string, name: string, role: string }>}
+ * Register a new student with Firebase Authentication
+ * and create their profile in Cloud Firestore.
+ *
+ * Public registration never accepts a role parameter.
+ * Faculty accounts must be provisioned through a trusted
+ * administrative process.
+ *
+ * @param {string} name
+ * @param {string} email
+ * @param {string} password
+ * @returns {Promise<{uid: string, email: string, name: string, role: string}>}
  */
-export async function registerUser(name, email, password, role = 'student') {
-  // Input validation
-  if (!name || !name.trim()) {
+export async function registerUser(name, email, password) {
+  if (typeof name !== 'string' || !name.trim()) {
     throw new Error('Name is required.');
   }
-  if (!email || !email.includes('@')) {
+
+  const normalizedEmail =
+    typeof email === 'string' ? email.trim().toLowerCase() : '';
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
     throw new Error('A valid email address is required.');
   }
-  if (!password || password.length < 6) {
+
+  if (typeof password !== 'string' || password.length < 6) {
     throw new Error('Password must be at least 6 characters.');
   }
-  const normalizedRole = role.toLowerCase().trim();
-  if (!['student', 'faculty'].includes(normalizedRole)) {
-    throw new Error('Invalid user role. Must be either "student" or "faculty".');
-  }
+
+  let user = null;
+  let profileCreated = false;
 
   try {
-    // 1. Create auth user in Firebase Authentication
-    const userCredential = await createUserWithEmailAndPassword(auth, email.trim(), password);
-    const user = userCredential.user;
+    const userCredential = await createUserWithEmailAndPassword(
+      auth,
+      normalizedEmail,
+      password
+    );
 
-    // 2. Set Firebase Auth displayName
-    await updateProfile(user, { displayName: name.trim() });
+    user = userCredential.user;
 
-    // 3. Create user document in Cloud Firestore /users/{uid}
-    const userDocRef = doc(db, 'users', user.uid);
+    await updateProfile(user, {
+      displayName: name.trim()
+    });
+
     const userData = {
       name: name.trim(),
-      email: email.trim().toLowerCase(),
-      role: normalizedRole,
+      email: normalizedEmail,
+      role: 'student',
       createdAt: serverTimestamp()
     };
-    await setDoc(userDocRef, userData);
+
+    await setDoc(doc(db, 'users', user.uid), userData);
+    profileCreated = true;
 
     return {
       uid: user.uid,
-      name: name.trim(),
       email: user.email,
-      role: normalizedRole
+      name: name.trim(),
+      role: 'student'
     };
   } catch (error) {
-    console.error('[authService.registerUser] Error registering user:', error);
-    // Provide clean, human-readable error messages
+    console.error('[authService.registerUser]', error);
+
+    // Avoid leaving an incomplete Auth account when profile
+    // creation fails. If profile creation succeeded, preserve
+    // the account rather than deleting a valid registered user.
+    if (user && !profileCreated) {
+      try {
+        await deleteUser(user);
+      } catch (cleanupError) {
+        console.error(
+          '[authService.registerUser] Account cleanup failed:',
+          cleanupError
+        );
+      }
+    }
+
     if (error.code === 'auth/email-already-in-use') {
       throw new Error('An account with this email already exists.');
-    } else if (error.code === 'auth/weak-password') {
-      throw new Error('The password is too weak. Please use at least 6 characters.');
-    } else if (error.code === 'auth/invalid-email') {
-      throw new Error('The email address is improperly formatted.');
     }
+
+    if (error.code === 'auth/weak-password') {
+      throw new Error('The password is too weak. Use at least 6 characters.');
+    }
+
+    if (error.code === 'auth/invalid-email') {
+      throw new Error('The email address is invalid.');
+    }
+
+    if (error.code === 'permission-denied') {
+      throw new Error(
+        'Your profile could not be created because database access was denied. Please contact support.'
+      );
+    }
+
     throw error;
   }
 }
 
 /**
- * Log in an existing user with Firebase Authentication.
- * 
- * @param {string} email - Email address
- * @param {string} password - Password
+ * Log in an existing user.
+ *
+ * @param {string} email
+ * @param {string} password
  * @returns {Promise<import('firebase/auth').User>}
  */
 export async function loginUser(email, password) {
-  if (!email || !password) {
+  if (
+    typeof email !== 'string' ||
+    !email.trim() ||
+    typeof password !== 'string' ||
+    !password
+  ) {
     throw new Error('Email and password are required.');
   }
 
   try {
-    const userCredential = await signInWithEmailAndPassword(auth, email.trim(), password);
+    const userCredential = await signInWithEmailAndPassword(
+      auth,
+      email.trim().toLowerCase(),
+      password
+    );
+
     return userCredential.user;
   } catch (error) {
-    console.error('[authService.loginUser] Error logging in:', error);
+    console.error('[authService.loginUser]', error);
+
     if (
       error.code === 'auth/user-not-found' ||
       error.code === 'auth/wrong-password' ||
       error.code === 'auth/invalid-credential'
     ) {
       throw new Error('Invalid email or password.');
-    } else if (error.code === 'auth/too-many-requests') {
-      throw new Error('Too many failed login attempts. Please try again later.');
     }
+
+    if (error.code === 'auth/too-many-requests') {
+      throw new Error('Too many failed attempts. Please try again later.');
+    }
+
+    if (error.code === 'auth/invalid-email') {
+      throw new Error('The email address is invalid.');
+    }
+
     throw error;
   }
 }
 
 /**
- * Log out the currently authenticated user.
- * 
+ * Log out the current user.
+ *
  * @returns {Promise<void>}
  */
 export async function logoutUser() {
   try {
     await signOut(auth);
   } catch (error) {
-    console.error('[authService.logoutUser] Error signing out:', error);
+    console.error('[authService.logoutUser]', error);
     throw new Error('Failed to sign out. Please try again.');
   }
 }
 
 /**
- * Get the current active user from Firebase Authentication.
- * 
+ * Get the current authenticated user.
+ *
  * @returns {import('firebase/auth').User | null}
  */
 export function getCurrentUser() {
@@ -130,37 +189,37 @@ export function getCurrentUser() {
 }
 
 /**
- * Fetch a user profile document from Cloud Firestore.
- * 
- * @param {string} uid - Firebase Auth UID
- * @returns {Promise<{ uid: string, name: string, email: string, role: string, createdAt: any } | null>}
+ * Fetch a profile from Cloud Firestore.
+ *
+ * @param {string} uid
+ * @returns {Promise<object | null>}
  */
 export async function getUserProfile(uid) {
-  if (!uid) {
+  if (!uid || typeof uid !== 'string') {
     return null;
   }
 
   try {
-    const userDocRef = doc(db, 'users', uid);
-    const snapshot = await getDoc(userDocRef);
+    const snapshot = await getDoc(doc(db, 'users', uid));
 
-    if (snapshot.exists()) {
-      return {
-        uid: snapshot.id,
-        ...snapshot.data()
-      };
+    if (!snapshot.exists()) {
+      return null;
     }
-    return null;
+
+    return {
+      uid: snapshot.id,
+      ...snapshot.data()
+    };
   } catch (error) {
-    console.error('[authService.getUserProfile] Error fetching profile:', error);
+    console.error('[authService.getUserProfile]', error);
     throw error;
   }
 }
 
 /**
- * Subscribe to authentication state changes.
- * 
- * @param {function(import('firebase/auth').User | null): void} callback
+ * Subscribe to Firebase Authentication state changes.
+ *
+ * @param {(user: import('firebase/auth').User | null) => void} callback
  * @returns {import('firebase/auth').Unsubscribe}
  */
 export function onAuthChanged(callback) {

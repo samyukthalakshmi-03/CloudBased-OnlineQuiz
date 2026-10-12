@@ -1,323 +1,372 @@
+
 import {
   collection,
   doc,
-  addDoc,
-  setDoc,
   getDoc,
   getDocs,
-  updateDoc,
-  deleteDoc,
   query,
   where,
-  orderBy,
-  serverTimestamp
+  serverTimestamp,
+  writeBatch
 } from 'firebase/firestore';
+
 import { db, auth } from '../firebase/config';
 
-/**
- * Validates a quiz payload before creation or update.
- * 
- * @param {object} quizData 
- */
+// ==========================================
+// Validation
+// ==========================================
+
 function validateQuizData(quizData) {
-  if (!quizData.title || !quizData.title.trim()) {
+  if (!quizData || typeof quizData !== 'object') {
+    throw new Error('Quiz data is required.');
+  }
+
+  if (
+    typeof quizData.title !== 'string' ||
+    !quizData.title.trim()
+  ) {
     throw new Error('Quiz title is required.');
   }
+
   const duration = Number(quizData.duration);
-  if (!duration || duration <= 0) {
+
+  if (!Number.isFinite(duration) || duration <= 0) {
     throw new Error('Quiz duration must be a positive number of minutes.');
   }
-  if (!Array.isArray(quizData.questions) || quizData.questions.length === 0) {
+
+  if (
+    !Array.isArray(quizData.questions) ||
+    quizData.questions.length === 0
+  ) {
     throw new Error('A quiz must contain at least one question.');
   }
 
   quizData.questions.forEach((q, index) => {
-    if (!q.questionText || !q.questionText.trim()) {
-      throw new Error(`Question ${index + 1} is missing the question text.`);
+    if (
+      typeof q.questionText !== 'string' ||
+      !q.questionText.trim()
+    ) {
+      throw new Error(`Question ${index + 1} is missing its text.`);
     }
-    if (!Array.isArray(q.options) || q.options.length < 2) {
-      throw new Error(`Question ${index + 1} must provide at least two answer options.`);
+
+    if (
+      !Array.isArray(q.options) ||
+      q.options.length < 2 ||
+      q.options.length > 10
+    ) {
+      throw new Error(
+        `Question ${index + 1} must have between 2 and 10 options.`
+      );
     }
-    const hasEmptyOption = q.options.some((opt) => !opt || !opt.trim());
-    if (hasEmptyOption) {
-      throw new Error(`Question ${index + 1} contains empty options.`);
+
+    if (
+      q.options.some(
+        option => typeof option !== 'string' || !option.trim()
+      )
+    ) {
+      throw new Error(`Question ${index + 1} contains an empty option.`);
     }
+
     const correctAnswer = Number(q.correctAnswer);
-    if (isNaN(correctAnswer) || correctAnswer < 0 || correctAnswer >= q.options.length) {
-      throw new Error(`Question ${index + 1} has an invalid correct answer selected.`);
+
+    if (
+      !Number.isInteger(correctAnswer) ||
+      correctAnswer < 0 ||
+      correctAnswer >= q.options.length
+    ) {
+      throw new Error(
+        `Question ${index + 1} has an invalid correct answer.`
+      );
     }
+
     const marks = Number(q.marks);
-    if (isNaN(marks) || marks <= 0) {
-      throw new Error(`Question ${index + 1} must have a positive marks value.`);
+
+    if (!Number.isFinite(marks) || marks <= 0) {
+      throw new Error(
+        `Question ${index + 1} must have positive marks.`
+      );
     }
   });
 }
 
-/**
- * Create a new quiz.
- * 
- * To ensure security without an external backend, the quiz questions are split:
- * - Public/Sanitized questions (without correctAnswer) are stored in `quizzes`
- * - The Answer Key is stored in the restricted `quizAnswers` collection
- * 
- * @param {object} quizData
- * @returns {Promise<{ id: string, message: string }>}
- */
+// Keep correct answers separate from student-visible quiz data.
+function prepareQuizData(quizData, facultyUid) {
+  const sanitizedQuestions = quizData.questions.map((q, index) => ({
+    questionIndex: index,
+    questionText: q.questionText.trim(),
+    options: q.options.map(option => option.trim()),
+    marks: Number(q.marks)
+  }));
+
+  const answers = quizData.questions.map((q, index) => ({
+    questionIndex: index,
+    correctAnswer: Number(q.correctAnswer),
+    marks: Number(q.marks)
+  }));
+
+  return {
+    quiz: {
+      title: quizData.title.trim(),
+      description: (quizData.description || '').trim(),
+      createdBy: facultyUid,
+      creatorEmail: auth.currentUser.email || '',
+      duration: Number(quizData.duration),
+      questions: sanitizedQuestions,
+      questionCount: sanitizedQuestions.length,
+      totalMarks: sanitizedQuestions.reduce(
+        (sum, question) => sum + question.marks,
+        0
+      ),
+      isPublished: Boolean(quizData.isPublished),
+      updatedAt: serverTimestamp()
+    },
+    answerKey: {
+      createdBy: facultyUid,
+      answers,
+      updatedAt: serverTimestamp()
+    }
+  };
+}
+
+function requireSignedInUser() {
+  const user = auth.currentUser;
+
+  if (!user) {
+    throw new Error('You must be signed in to perform this action.');
+  }
+
+  return user;
+}
+
+// ==========================================
+// Create quiz
+// ==========================================
+
 export async function createQuiz(quizData) {
-  const currentUser = auth.currentUser;
-  if (!currentUser) {
-    throw new Error('You must be logged in as faculty to create a quiz.');
-  }
+  const currentUser = requireSignedInUser();
 
   validateQuizData(quizData);
 
-  try {
-    // 1. Sanitize questions (strip correctAnswer)
-    const sanitizedQuestions = quizData.questions.map((q, index) => ({
-      questionIndex: index,
-      questionText: q.questionText.trim(),
-      options: q.options.map(opt => opt.trim()),
-      marks: Number(q.marks) || 1
-    }));
+  const { quiz, answerKey } = prepareQuizData(
+    quizData,
+    currentUser.uid
+  );
 
-    // 2. Extract answer key
-    const answersData = quizData.questions.map((q, index) => ({
-      questionIndex: index,
-      correctAnswer: Number(q.correctAnswer),
-      marks: Number(q.marks) || 1
-    }));
+  // Allocate the quiz ID before writing either document.
+  const quizRef = doc(collection(db, 'quizzes'));
+  const answerRef = doc(db, 'quizAnswers', quizRef.id);
 
-    // 3. Save sanitized quiz to /quizzes
-    const quizzesRef = collection(db, 'quizzes');
-    const newQuizDoc = await addDoc(quizzesRef, {
-      title: quizData.title.trim(),
-      description: (quizData.description || '').trim(),
-      createdBy: currentUser.uid,
-      creatorEmail: currentUser.email,
-      duration: Number(quizData.duration),
-      questions: sanitizedQuestions,
-      questionCount: sanitizedQuestions.length,
-      totalMarks: sanitizedQuestions.reduce((sum, q) => sum + q.marks, 0),
-      isPublished: Boolean(quizData.isPublished),
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp()
-    });
+  const batch = writeBatch(db);
 
-    const quizId = newQuizDoc.id;
+  batch.set(quizRef, {
+    ...quiz,
+    createdAt: serverTimestamp()
+  });
 
-    // 4. Save answer key to /quizAnswers/{quizId}
-    const answerDocRef = doc(db, 'quizAnswers', quizId);
-    await setDoc(answerDocRef, {
-      quizId: quizId,
-      createdBy: currentUser.uid,
-      answers: answersData,
-      updatedAt: serverTimestamp()
-    });
+  batch.set(answerRef, {
+    ...answerKey,
+    quizId: quizRef.id
+  });
 
-    return { id: quizId, message: 'Quiz created successfully.' };
-  } catch (error) {
-    console.error('[quizService.createQuiz] Error creating quiz:', error);
-    throw error;
-  }
+  // Both documents succeed together or neither is committed.
+  await batch.commit();
+
+  return {
+    id: quizRef.id,
+    message: 'Quiz created successfully.'
+  };
 }
 
-/**
- * Update an existing quiz (Faculty only).
- * 
- * @param {string} quizId 
- * @param {object} quizData 
- * @returns {Promise<void>}
- */
+// ==========================================
+// Update quiz
+// ==========================================
+
 export async function updateQuiz(quizId, quizData) {
-  const currentUser = auth.currentUser;
-  if (!currentUser) {
-    throw new Error('Authentication required.');
-  }
-  if (!quizId) {
+  const currentUser = requireSignedInUser();
+
+  if (!quizId || typeof quizId !== 'string') {
     throw new Error('Quiz ID is required.');
   }
 
   validateQuizData(quizData);
 
-  try {
-    const sanitizedQuestions = quizData.questions.map((q, index) => ({
-      questionIndex: index,
-      questionText: q.questionText.trim(),
-      options: q.options.map(opt => opt.trim()),
-      marks: Number(q.marks) || 1
-    }));
+  const quizRef = doc(db, 'quizzes', quizId);
+  const answerRef = doc(db, 'quizAnswers', quizId);
 
-    const answersData = quizData.questions.map((q, index) => ({
-      questionIndex: index,
-      correctAnswer: Number(q.correctAnswer),
-      marks: Number(q.marks) || 1
-    }));
+  const quizSnapshot = await getDoc(quizRef);
 
-    const quizDocRef = doc(db, 'quizzes', quizId);
-    await updateDoc(quizDocRef, {
-      title: quizData.title.trim(),
-      description: (quizData.description || '').trim(),
-      duration: Number(quizData.duration),
-      questions: sanitizedQuestions,
-      questionCount: sanitizedQuestions.length,
-      totalMarks: sanitizedQuestions.reduce((sum, q) => sum + q.marks, 0),
-      isPublished: Boolean(quizData.isPublished),
-      updatedAt: serverTimestamp()
-    });
-
-    const answerDocRef = doc(db, 'quizAnswers', quizId);
-    await setDoc(answerDocRef, {
-      quizId: quizId,
-      createdBy: currentUser.uid,
-      answers: answersData,
-      updatedAt: serverTimestamp()
-    }, { merge: true });
-  } catch (error) {
-    console.error('[quizService.updateQuiz] Error updating quiz:', error);
-    throw error;
+  if (!quizSnapshot.exists()) {
+    throw new Error('Quiz not found.');
   }
+
+  if (quizSnapshot.data().createdBy !== currentUser.uid) {
+    throw new Error('You are not authorized to update this quiz.');
+  }
+
+  const { quiz, answerKey } = prepareQuizData(
+    quizData,
+    currentUser.uid
+  );
+
+  const batch = writeBatch(db);
+
+  // Do not overwrite original creator or creation timestamp.
+  batch.update(quizRef, quiz);
+
+  batch.set(answerRef, {
+    ...answerKey,
+    quizId
+  });
+
+  await batch.commit();
 }
 
-/**
- * Delete a quiz and its corresponding answer key.
- * 
- * @param {string} quizId 
- * @returns {Promise<void>}
- */
+// ==========================================
+// Delete quiz
+// ==========================================
+
 export async function deleteQuiz(quizId) {
-  if (!quizId) {
+  const currentUser = requireSignedInUser();
+
+  if (!quizId || typeof quizId !== 'string') {
     throw new Error('Quiz ID is required.');
   }
 
-  try {
-    const quizDocRef = doc(db, 'quizzes', quizId);
-    const answerDocRef = doc(db, 'quizAnswers', quizId);
+  const quizRef = doc(db, 'quizzes', quizId);
+  const answerRef = doc(db, 'quizAnswers', quizId);
 
-    await deleteDoc(quizDocRef);
-    await deleteDoc(answerDocRef);
-  } catch (error) {
-    console.error('[quizService.deleteQuiz] Error deleting quiz:', error);
-    throw error;
+  const quizSnapshot = await getDoc(quizRef);
+
+  if (!quizSnapshot.exists()) {
+    throw new Error('Quiz not found.');
   }
+
+  if (quizSnapshot.data().createdBy !== currentUser.uid) {
+    throw new Error('You are not authorized to delete this quiz.');
+  }
+
+  // Preserve quiz documents needed by existing result history.
+  const resultsQuery = query(
+    collection(db, 'results'),
+    where('quizId', '==', quizId),
+    where('facultyId', '==', currentUser.uid)
+  );
+
+  const resultsSnapshot = await getDocs(resultsQuery);
+
+  if (!resultsSnapshot.empty) {
+    throw new Error(
+      'This quiz has existing submissions and cannot be deleted.'
+    );
+  }
+
+  const batch = writeBatch(db);
+  batch.delete(quizRef);
+  batch.delete(answerRef);
+
+  await batch.commit();
 }
 
-/**
- * Get all published quizzes available for students.
- * 
- * @returns {Promise<Array<object>>}
- */
+// ==========================================
+// Get published quizzes
+// ==========================================
+
 export async function getAvailableQuizzes() {
-  try {
-    const quizzesRef = collection(db, 'quizzes');
-    const q = query(
-      quizzesRef,
-      where('isPublished', '==', true)
-    );
-    const snapshot = await getDocs(q);
+  const quizzesQuery = query(
+    collection(db, 'quizzes'),
+    where('isPublished', '==', true)
+  );
 
-    const quizzes = snapshot.docs.map(docSnap => ({
-      id: docSnap.id,
-      ...docSnap.data()
-    }));
+  const snapshot = await getDocs(quizzesQuery);
 
-    // Sort descending by createdAt in memory in case composite index is still building
-    return quizzes.sort((a, b) => {
-      const timeA = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
-      const timeB = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
+  return snapshot.docs
+    .map(document => ({
+      id: document.id,
+      ...document.data()
+    }))
+    .sort((a, b) => {
+      const timeA = a.createdAt?.toMillis?.() || 0;
+      const timeB = b.createdAt?.toMillis?.() || 0;
       return timeB - timeA;
     });
-  } catch (error) {
-    console.error('[quizService.getAvailableQuizzes] Error fetching quizzes:', error);
-    throw error;
-  }
 }
 
-/**
- * Get a single quiz by ID.
- * If requested by the faculty creator, merges the correct answers from `quizAnswers`.
- * If requested by a student, returns the sanitized quiz (correct answers omitted).
- * 
- * @param {string} quizId 
- * @returns {Promise<object | null>}
- */
+// ==========================================
+// Get quiz by ID
+// ==========================================
+
 export async function getQuizById(quizId) {
   if (!quizId) {
     throw new Error('Quiz ID is required.');
   }
 
-  try {
-    const quizDocRef = doc(db, 'quizzes', quizId);
-    const snapshot = await getDoc(quizDocRef);
+  const quizRef = doc(db, 'quizzes', quizId);
+  const snapshot = await getDoc(quizRef);
 
-    if (!snapshot.exists()) {
-      return null;
-    }
-
-    const quizData = {
-      id: snapshot.id,
-      ...snapshot.data()
-    };
-
-    const currentUser = auth.currentUser;
-
-    // If current user is the faculty author, attempt to merge correct answers for editing
-    if (currentUser && quizData.createdBy === currentUser.uid) {
-      try {
-        const answerDocRef = doc(db, 'quizAnswers', quizId);
-        const answerSnap = await getDoc(answerDocRef);
-        if (answerSnap.exists()) {
-          const answersList = answerSnap.data().answers || [];
-          quizData.questions = quizData.questions.map((q, idx) => {
-            const foundAns = answersList.find(a => a.questionIndex === idx);
-            return {
-              ...q,
-              correctAnswer: foundAns ? foundAns.correctAnswer : 0
-            };
-          });
-        }
-      } catch (err) {
-        console.warn('[quizService.getQuizById] Could not fetch answer key:', err);
-      }
-    }
-
-    return quizData;
-  } catch (error) {
-    console.error('[quizService.getQuizById] Error retrieving quiz:', error);
-    throw error;
+  if (!snapshot.exists()) {
+    return null;
   }
+
+  const quizData = {
+    id: snapshot.id,
+    ...snapshot.data()
+  };
+
+  const currentUser = auth.currentUser;
+
+  // Only the creator can retrieve the answer key through
+  // Firestore rules. Rules remain the actual security boundary.
+  if (currentUser && quizData.createdBy === currentUser.uid) {
+    const answerRef = doc(db, 'quizAnswers', quizId);
+    const answerSnapshot = await getDoc(answerRef);
+
+    if (answerSnapshot.exists()) {
+      const answers = answerSnapshot.data().answers || [];
+
+      quizData.questions = quizData.questions.map((question, index) => {
+        const answer = answers.find(
+          item => item.questionIndex === index
+        );
+
+        return {
+          ...question,
+          correctAnswer: answer?.correctAnswer
+        };
+      });
+    }
+  }
+
+  return quizData;
 }
 
-/**
- * Get all quizzes created by a specific faculty member.
- * 
- * @param {string} facultyId 
- * @returns {Promise<Array<object>>}
- */
+// ==========================================
+// Get quizzes created by faculty
+// ==========================================
+
 export async function getFacultyQuizzes(facultyId) {
-  if (!facultyId) {
-    throw new Error('Faculty ID is required.');
+  const currentUser = requireSignedInUser();
+
+  if (!facultyId || facultyId !== currentUser.uid) {
+    throw new Error(
+      'You can only retrieve quizzes associated with your own account.'
+    );
   }
 
-  try {
-    const quizzesRef = collection(db, 'quizzes');
-    const q = query(
-      quizzesRef,
-      where('createdBy', '==', facultyId)
-    );
-    const snapshot = await getDocs(q);
+  const quizzesQuery = query(
+    collection(db, 'quizzes'),
+    where('createdBy', '==', currentUser.uid)
+  );
 
-    const quizzes = snapshot.docs.map(docSnap => ({
-      id: docSnap.id,
-      ...docSnap.data()
-    }));
+  const snapshot = await getDocs(quizzesQuery);
 
-    return quizzes.sort((a, b) => {
-      const timeA = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
-      const timeB = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
+  return snapshot.docs
+    .map(document => ({
+      id: document.id,
+      ...document.data()
+    }))
+    .sort((a, b) => {
+      const timeA = a.createdAt?.toMillis?.() || 0;
+      const timeB = b.createdAt?.toMillis?.() || 0;
       return timeB - timeA;
     });
-  } catch (error) {
-    console.error('[quizService.getFacultyQuizzes] Error fetching faculty quizzes:', error);
-    throw error;
-  }
 }

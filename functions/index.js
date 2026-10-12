@@ -1,312 +1,528 @@
+
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { initializeApp } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 
 // Initialize Firebase Admin SDK
 initializeApp();
+
 const db = getFirestore();
 
-/**
- * Callable Cloud Function: submitQuiz
- * 
- * Secure server-side quiz grading and result creation.
- * 
- * Security guarantees:
- * 1. Enforces user authentication via Firebase Auth context.
- * 2. Uses authenticated UID (`request.auth.uid`), ignoring any client-provided student ID.
- * 3. Accepts only `quizId`, `answers`, and `timeTaken`.
- * 4. Strictly validates all payload data types, bounds, and structures.
- * 5. Verifies the quiz exists and is actively published.
- * 6. Verifies that the caller has the 'student' role.
- * 7. Reads the authoritative answer key from the restricted `/quizAnswers` collection via Admin SDK.
- * 8. Validates that every submitted question index and option choice is within valid bounds.
- * 9. Authoritatively computes score and total marks on the server.
- * 10. Uses a deterministic result ID (`${uid}_${quizId}`) and a Firestore transaction
- *     to prevent duplicate or concurrent submission attempts.
- * 11. Stores finalized result and sanitized leaderboard records atomically.
- * 12. Returns the result summary without exposing the full answer key.
- */
+const MAX_TIME_TAKEN_SECONDS = 24 * 60 * 60;
+const MAX_QUESTIONS = 200;
+const MAX_OPTIONS_PER_QUESTION = 20;
+
+// ==========================================
+// Shared Validation Helpers
+// ==========================================
+
+function validateQuizId(quizId) {
+  if (
+    typeof quizId !== "string" ||
+    !quizId.trim() ||
+    quizId.trim().length > 200
+  ) {
+    throw new HttpsError(
+      "invalid-argument",
+      "A valid quizId is required."
+    );
+  }
+
+  return quizId.trim();
+}
+
+async function getUserProfile(uid) {
+  const snapshot = await db.collection("users").doc(uid).get();
+
+  if (!snapshot.exists) {
+    throw new HttpsError(
+      "permission-denied",
+      "A registered user profile is required."
+    );
+  }
+
+  return snapshot.data() || {};
+}
+
+async function getQuizAndAnswerKey(quizId) {
+  const quizRef = db.collection("quizzes").doc(quizId);
+  const answerRef = db.collection("quizAnswers").doc(quizId);
+
+  const [quizSnap, answerSnap] = await Promise.all([
+    quizRef.get(),
+    answerRef.get()
+  ]);
+
+  if (!quizSnap.exists) {
+    throw new HttpsError("not-found", "Quiz not found.");
+  }
+
+  if (!answerSnap.exists) {
+    throw new HttpsError(
+      "failed-precondition",
+      "The quiz answer key is missing."
+    );
+  }
+
+  const quiz = quizSnap.data() || {};
+  const answerKey = answerSnap.data() || {};
+
+  if (
+    typeof quiz.createdBy !== "string" ||
+    !quiz.createdBy ||
+    answerKey.createdBy !== quiz.createdBy
+  ) {
+    throw new HttpsError(
+      "failed-precondition",
+      "Quiz ownership or answer-key ownership is invalid."
+    );
+  }
+
+  if (
+    answerKey.quizId !== undefined &&
+    answerKey.quizId !== quizId
+  ) {
+    throw new HttpsError(
+      "failed-precondition",
+      "The answer key does not belong to this quiz."
+    );
+  }
+
+  const questions = quiz.questions;
+
+  if (
+    !Array.isArray(questions) ||
+    questions.length === 0 ||
+    questions.length > MAX_QUESTIONS
+  ) {
+    throw new HttpsError(
+      "failed-precondition",
+      "The quiz has an invalid number of questions."
+    );
+  }
+
+  const rawAnswers = answerKey.answers;
+
+  if (
+    !Array.isArray(rawAnswers) ||
+    rawAnswers.length !== questions.length
+  ) {
+    throw new HttpsError(
+      "failed-precondition",
+      "The answer key is incomplete."
+    );
+  }
+
+  const answerMap = new Map();
+
+  for (let i = 0; i < questions.length; i++) {
+    const question = questions[i];
+
+    if (
+      !question ||
+      !Array.isArray(question.options) ||
+      question.options.length < 2 ||
+      question.options.length > MAX_OPTIONS_PER_QUESTION
+    ) {
+      throw new HttpsError(
+        "failed-precondition",
+        `Question ${i + 1} has invalid options.`
+      );
+    }
+
+    const marks = question.marks === undefined ? 1 : question.marks;
+
+    if (
+      typeof marks !== "number" ||
+      !Number.isFinite(marks) ||
+      marks <= 0
+    ) {
+      throw new HttpsError(
+        "failed-precondition",
+        `Question ${i + 1} has invalid marks.`
+      );
+    }
+  }
+
+  for (const item of rawAnswers) {
+    if (!item || typeof item !== "object") {
+      throw new HttpsError(
+        "failed-precondition",
+        "The answer key contains an invalid entry."
+      );
+    }
+
+    const { questionIndex, correctAnswer } = item;
+
+    if (
+      !Number.isInteger(questionIndex) ||
+      questionIndex < 0 ||
+      questionIndex >= questions.length ||
+      answerMap.has(questionIndex)
+    ) {
+      throw new HttpsError(
+        "failed-precondition",
+        "The answer key contains an invalid or duplicate question index."
+      );
+    }
+
+    const question = questions[questionIndex];
+
+    if (
+      !Number.isInteger(correctAnswer) ||
+      correctAnswer < 0 ||
+      correctAnswer >= question.options.length
+    ) {
+      throw new HttpsError(
+        "failed-precondition",
+        `The answer key for Question ${questionIndex + 1} is invalid.`
+      );
+    }
+
+    const questionMarks =
+      question.marks === undefined ? 1 : question.marks;
+
+    if (
+      item.marks !== undefined &&
+      (
+        typeof item.marks !== "number" ||
+        !Number.isFinite(item.marks) ||
+        item.marks !== questionMarks
+      )
+    ) {
+      throw new HttpsError(
+        "failed-precondition",
+        `The answer-key marks for Question ${questionIndex + 1} do not match the quiz.`
+      );
+    }
+
+    answerMap.set(questionIndex, {
+      correctAnswer,
+      marks: questionMarks
+    });
+  }
+
+  if (answerMap.size !== questions.length) {
+    throw new HttpsError(
+      "failed-precondition",
+      "The answer key does not cover every question."
+    );
+  }
+
+  const totalMarks = questions.reduce(
+    (sum, question) =>
+      sum + (question.marks === undefined ? 1 : question.marks),
+    0
+  );
+
+  if (!Number.isFinite(totalMarks) || totalMarks <= 0) {
+    throw new HttpsError(
+      "failed-precondition",
+      "The quiz total marks are invalid."
+    );
+  }
+
+  return {
+    quiz,
+    questions,
+    answerMap,
+    totalMarks
+  };
+}
+
+// ==========================================
+// 1. submitQuiz
+// Secure server-side grading and result creation
+// ==========================================
+
 exports.submitQuiz = onCall(async (request) => {
-  // 1. Authentication check
   if (!request.auth || !request.auth.uid) {
     throw new HttpsError(
       "unauthenticated",
-      "Authentication required. You must be signed in to submit a quiz."
+      "You must sign in to submit a quiz."
     );
   }
 
   const studentUid = request.auth.uid;
-  const payload = request.data || {};
+  const payload = request.data;
 
-  // 2. Extract and validate only the permitted client fields: quizId, answers, timeTaken
-  const { quizId, answers, timeTaken } = payload;
-
-  if (!quizId || typeof quizId !== "string" || !quizId.trim()) {
+  if (
+    !payload ||
+    typeof payload !== "object" ||
+    Array.isArray(payload)
+  ) {
     throw new HttpsError(
       "invalid-argument",
-      "Invalid or missing quizId. A non-empty string is required."
+      "A valid request payload is required."
     );
   }
-  const cleanQuizId = quizId.trim();
 
-  if (!answers || typeof answers !== "object" || Array.isArray(answers)) {
+  // Reject all client fields except the three permitted fields.
+  const allowedFields = ["quizId", "answers", "timeTaken"];
+
+  if (Object.keys(payload).some((key) => !allowedFields.includes(key))) {
     throw new HttpsError(
       "invalid-argument",
-      "Invalid answers format. Answers must be an object mapping question indices to selected option indices."
+      "The request contains unsupported fields."
     );
   }
 
-  const parsedTimeTaken = Number(timeTaken);
-  if (isNaN(parsedTimeTaken) || parsedTimeTaken < 0) {
+  const quizId = validateQuizId(payload.quizId);
+  const { answers, timeTaken } = payload;
+
+  if (
+    !answers ||
+    typeof answers !== "object" ||
+    Array.isArray(answers)
+  ) {
     throw new HttpsError(
       "invalid-argument",
-      "Invalid timeTaken. Time taken must be a non-negative number of seconds."
+      "Answers must be an object mapping question indices to selected option indices."
     );
   }
-  const cleanTimeTaken = Math.max(0, Math.round(parsedTimeTaken));
 
-  // 3. Verify user profile and student role
-  const userDocRef = db.collection("users").doc(studentUid);
-  const userSnap = await userDocRef.get();
-
-  if (!userSnap.exists) {
+  if (
+    typeof timeTaken !== "number" ||
+    !Number.isFinite(timeTaken) ||
+    timeTaken < 0 ||
+    timeTaken > MAX_TIME_TAKEN_SECONDS
+  ) {
     throw new HttpsError(
-      "not-found",
-      "Student user profile not found in database."
+      "invalid-argument",
+      "timeTaken must be a number between 0 and 86400 seconds."
     );
   }
 
-  const userData = userSnap.data() || {};
+  const cleanTimeTaken = Math.round(timeTaken);
+
+  // Verify the registered student role.
+  const userData = await getUserProfile(studentUid);
+
   if (userData.role !== "student") {
     throw new HttpsError(
       "permission-denied",
-      "Access denied. Only registered students are permitted to submit quizzes."
+      "Only registered students can submit quizzes."
     );
   }
 
-  // 4. Verify quiz exists and is published
-  const quizDocRef = db.collection("quizzes").doc(cleanQuizId);
-  const quizSnap = await quizDocRef.get();
+  // Load the quiz and its authoritative answer key.
+  const { quiz, questions, answerMap, totalMarks } =
+    await getQuizAndAnswerKey(quizId);
 
-  if (!quizSnap.exists) {
-    throw new HttpsError(
-      "not-found",
-      "The specified quiz does not exist or has been removed."
-    );
-  }
-
-  const quizData = quizSnap.data() || {};
-  if (!quizData.isPublished) {
+  if (quiz.isPublished !== true) {
     throw new HttpsError(
       "failed-precondition",
       "This quiz is not currently accepting submissions."
     );
   }
 
-  const questions = Array.isArray(quizData.questions) ? quizData.questions : [];
-  if (questions.length === 0) {
-    throw new HttpsError(
-      "failed-precondition",
-      "The specified quiz has no questions available."
-    );
-  }
-
-  // 5. Retrieve authoritative answer key using Firebase Admin SDK
-  const answerKeyDocRef = db.collection("quizAnswers").doc(cleanQuizId);
-  const answerKeySnap = await answerKeyDocRef.get();
-
-  if (!answerKeySnap.exists) {
-    throw new HttpsError(
-      "internal",
-      "Unable to grade quiz: Authoritative answer key could not be retrieved."
-    );
-  }
-
-  const answerKeyData = answerKeySnap.data() || {};
-  const rawKeyList = Array.isArray(answerKeyData.answers) ? answerKeyData.answers : [];
-
-  // Build answer key lookup map: questionIndex -> { correctAnswer, marks }
-  const answerKeyMap = new Map();
-  rawKeyList.forEach((item) => {
-    const qIndex = Number(item.questionIndex);
-    answerKeyMap.set(qIndex, {
-      correctAnswer: Number(item.correctAnswer),
-      marks: Number(item.marks) || 1
-    });
-  });
-
-  // Calculate authoritative total marks from quiz question definitions
-  const authoritativeTotalMarks = questions.reduce(
-    (sum, q) => sum + (Number(q.marks) || 1),
-    0
-  );
-
-  // 6. Validate submitted question indices and choices
-  const totalQuestions = questions.length;
+  // Validate and sanitize each submitted answer.
   const sanitizedAnswers = {};
+  const answerEntries = Object.entries(answers);
 
-  for (const [key, value] of Object.entries(answers)) {
-    const qIndex = Number(key);
-    if (!Number.isInteger(qIndex) || qIndex < 0 || qIndex >= totalQuestions) {
-      throw new HttpsError(
-        "invalid-argument",
-        `Submitted question index '${key}' is invalid. Quiz contains ${totalQuestions} questions.`
-      );
-    }
-
-    const selectedChoice = Number(value);
-    const questionObj = questions[qIndex];
-    const optionCount = Array.isArray(questionObj.options) ? questionObj.options.length : 0;
-
-    if (!Number.isInteger(selectedChoice) || selectedChoice < 0 || selectedChoice >= optionCount) {
-      throw new HttpsError(
-        "invalid-argument",
-        `Selected choice '${value}' is out of bounds for Question ${qIndex + 1} (options range: 0 to ${optionCount - 1}).`
-      );
-    }
-
-    sanitizedAnswers[qIndex] = selectedChoice;
+  if (answerEntries.length > questions.length) {
+    throw new HttpsError(
+      "invalid-argument",
+      "Too many answers were submitted."
+    );
   }
 
-  // 7. Calculate server-side score against authoritative answer key
+  for (const [key, value] of answerEntries) {
+    // Only canonical non-negative integer indices are accepted.
+    if (!/^(0|[1-9]\d*)$/.test(key)) {
+      throw new HttpsError(
+        "invalid-argument",
+        `Invalid question index: ${key}.`
+      );
+    }
+
+    const questionIndex = Number(key);
+
+    if (
+      !Number.isSafeInteger(questionIndex) ||
+      questionIndex < 0 ||
+      questionIndex >= questions.length
+    ) {
+      throw new HttpsError(
+        "invalid-argument",
+        `Question index ${key} is outside the valid range.`
+      );
+    }
+
+    if (
+      typeof value !== "number" ||
+      !Number.isInteger(value) ||
+      value < 0 ||
+      value >= questions[questionIndex].options.length
+    ) {
+      throw new HttpsError(
+        "invalid-argument",
+        `Invalid selected option for Question ${questionIndex + 1}.`
+      );
+    }
+
+    sanitizedAnswers[questionIndex] = value;
+  }
+
+  // Calculate the score using only server-controlled quiz data.
   let calculatedScore = 0;
-  for (const [qIndexStr, selectedChoice] of Object.entries(sanitizedAnswers)) {
-    const qIndex = Number(qIndexStr);
-    const keyInfo = answerKeyMap.get(qIndex);
-    if (keyInfo && selectedChoice === keyInfo.correctAnswer) {
-      calculatedScore += keyInfo.marks;
+
+  for (const [key, selectedChoice] of Object.entries(sanitizedAnswers)) {
+    const questionIndex = Number(key);
+    const answerInfo = answerMap.get(questionIndex);
+
+    if (selectedChoice === answerInfo.correctAnswer) {
+      calculatedScore += answerInfo.marks;
     }
   }
 
-  // 8. Enforce single submission with deterministic result ID & Firestore transaction
-  const resultId = `${studentUid}_${cleanQuizId}`;
-  const resultDocRef = db.collection("results").doc(resultId);
-  const leaderboardDocRef = db.collection("leaderboards").doc(resultId);
+  const resultId = `${studentUid}_${quizId}`;
+  const resultRef = db.collection("results").doc(resultId);
+  const leaderboardRef = db.collection("leaderboards").doc(resultId);
 
-  const studentName = userData.name || request.auth.token.name || "Student";
-  const studentEmail = userData.email || request.auth.token.email || "";
+  const studentName =
+    userData.name || request.auth.token.name || "Student";
 
+  const studentEmail =
+    userData.email || request.auth.token.email || "";
+
+  // Transaction prevents duplicate submissions and partial writes.
   await db.runTransaction(async (transaction) => {
-    const existingResultSnap = await transaction.get(resultDocRef);
-    if (existingResultSnap.exists) {
+    const existingResult = await transaction.get(resultRef);
+
+    if (existingResult.exists) {
       throw new HttpsError(
         "already-exists",
-        "You have already submitted this quiz. Multiple attempts are not permitted."
+        "You have already submitted this quiz."
       );
     }
 
-    // Authoritative result document
-    const resultPayload = {
+    const now = FieldValue.serverTimestamp();
+
+    transaction.create(resultRef, {
       studentId: studentUid,
-      studentName: studentName,
-      studentEmail: studentEmail,
-      facultyId: quizData.createdBy || "",
-      quizId: cleanQuizId,
-      quizTitle: quizData.title || "Quiz",
+      studentName,
+      studentEmail,
+      facultyId: quiz.createdBy,
+      quizId,
+      quizTitle: quiz.title || "Quiz",
       score: calculatedScore,
-      totalMarks: authoritativeTotalMarks,
+      totalMarks,
       timeTaken: cleanTimeTaken,
       answers: sanitizedAnswers,
       completed: true,
-      submittedAt: FieldValue.serverTimestamp(),
-      finalizedAt: FieldValue.serverTimestamp()
-    };
+      submittedAt: now,
+      finalizedAt: now
+    });
 
-    transaction.set(resultDocRef, resultPayload);
-
-    // Sanitized leaderboard entry (omits student answers for student privacy)
-    transaction.set(leaderboardDocRef, {
+    transaction.set(leaderboardRef, {
       studentId: studentUid,
-      studentName: studentName,
-      facultyId: quizData.createdBy || "",
-      quizId: cleanQuizId,
+      studentName,
+      facultyId: quiz.createdBy,
+      quizId,
       score: calculatedScore,
-      totalMarks: authoritativeTotalMarks,
+      totalMarks,
       timeTaken: cleanTimeTaken,
-      submittedAt: FieldValue.serverTimestamp()
+      submittedAt: now
     });
   });
 
-  // 9. Return summary without exposing full answer key
+  // Return the score summary, not the correct-answer key.
   return {
-    resultId: resultId,
-    quizId: cleanQuizId,
-    quizTitle: quizData.title,
+    resultId,
+    quizId,
+    quizTitle: quiz.title || "Quiz",
     score: calculatedScore,
-    totalMarks: authoritativeTotalMarks,
+    totalMarks,
     timeTaken: cleanTimeTaken,
     answers: sanitizedAnswers,
     completed: true
   };
 });
 
-/**
- * Callable Cloud Function: getQuizReview
- * 
- * Secure result-review mechanism.
- * Returns correct answers only to:
- * - A student who has already completed and submitted this quiz.
- * - The faculty creator of the quiz.
- */
+// ==========================================
+// 2. getQuizReview
+// Return answers only to the quiz's faculty creator
+// or a student who has already submitted it.
+// ==========================================
+
 exports.getQuizReview = onCall(async (request) => {
   if (!request.auth || !request.auth.uid) {
     throw new HttpsError(
       "unauthenticated",
-      "Authentication required. You must be signed in to review quiz results."
+      "You must sign in to review a quiz."
     );
   }
 
   const uid = request.auth.uid;
-  const { quizId } = request.data || {};
+  const payload = request.data;
 
-  if (!quizId || typeof quizId !== "string" || !quizId.trim()) {
+  if (
+    !payload ||
+    typeof payload !== "object" ||
+    Array.isArray(payload) ||
+    Object.keys(payload).some((key) => key !== "quizId")
+  ) {
     throw new HttpsError(
       "invalid-argument",
-      "Invalid or missing quizId. A non-empty string is required."
+      "Provide only a valid quizId."
     );
   }
-  const cleanQuizId = quizId.trim();
 
-  // Fetch quiz to check faculty ownership
-  const quizDocRef = db.collection("quizzes").doc(cleanQuizId);
-  const quizSnap = await quizDocRef.get();
+  const quizId = validateQuizId(payload.quizId);
 
-  if (!quizSnap.exists) {
-    throw new HttpsError("not-found", "Quiz not found.");
+  // Verify the caller's registered role.
+  const userData = await getUserProfile(uid);
+
+  if (!["student", "faculty"].includes(userData.role)) {
+    throw new HttpsError(
+      "permission-denied",
+      "Your account is not authorized to review quizzes."
+    );
   }
 
-  const quizData = quizSnap.data() || {};
-  const isCreatorFaculty = quizData.createdBy === uid;
+  const { quiz, questions, answerMap } =
+    await getQuizAndAnswerKey(quizId);
 
-  // If not the faculty creator, verify that the student has completed a submission
-  if (!isCreatorFaculty) {
-    const resultDocRef = db.collection("results").doc(`${uid}_${cleanQuizId}`);
-    const resultSnap = await resultDocRef.get();
+  const isFacultyCreator =
+    userData.role === "faculty" &&
+    quiz.createdBy === uid;
 
-    if (!resultSnap.exists || !resultSnap.data()?.completed) {
+  if (userData.role === "faculty" && !isFacultyCreator) {
+    throw new HttpsError(
+      "permission-denied",
+      "Faculty can review only quizzes they created."
+    );
+  }
+
+  if (userData.role === "student") {
+    const resultId = `${uid}_${quizId}`;
+    const resultSnap = await db.collection("results").doc(resultId).get();
+
+    if (
+      !resultSnap.exists ||
+      resultSnap.data()?.studentId !== uid ||
+      resultSnap.data()?.quizId !== quizId ||
+      resultSnap.data()?.completed !== true
+    ) {
       throw new HttpsError(
         "permission-denied",
-        "Access denied. You may only review answers after completing and submitting the quiz."
+        "You can review answers only after submitting this quiz."
       );
     }
   }
 
-  // Retrieve answer key securely via Admin SDK
-  const answerDocRef = db.collection("quizAnswers").doc(cleanQuizId);
-  const answerSnap = await answerDocRef.get();
-
-  if (!answerSnap.exists) {
-    throw new HttpsError("not-found", "Answer key not found for this quiz.");
-  }
-
-  const rawAnswers = Array.isArray(answerSnap.data()?.answers) ? answerSnap.data().answers : [];
-
+  // Return the answer key only after the authorization checks above.
   return {
-    quizId: cleanQuizId,
-    answerKey: rawAnswers.map((item) => ({
-      questionIndex: Number(item.questionIndex),
-      correctAnswer: Number(item.correctAnswer),
-      marks: Number(item.marks) || 1
-    }))
+    quizId,
+    answerKey: questions.map((question, questionIndex) => {
+      const answer = answerMap.get(questionIndex);
+
+      return {
+        questionIndex,
+        correctAnswer: answer.correctAnswer,
+        marks: answer.marks
+      };
+    })
   };
 });
