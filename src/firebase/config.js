@@ -1,3 +1,4 @@
+
 import { initializeApp } from 'firebase/app';
 import { getAuth, connectAuthEmulator } from 'firebase/auth';
 import { getFirestore, connectFirestoreEmulator } from 'firebase/firestore';
@@ -13,39 +14,45 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID
 };
 
-// Check if configuration variables are configured
+// Verify required configuration
 export const isFirebaseConfigured = Boolean(
   firebaseConfig.apiKey &&
+  firebaseConfig.authDomain &&
   firebaseConfig.projectId &&
+  firebaseConfig.appId &&
   firebaseConfig.apiKey !== 'your_api_key_here'
 );
 
 if (!isFirebaseConfigured) {
   console.warn(
-    '[Firebase Setup Warning] Firebase environment variables are not yet configured. ' +
-    'Please copy .env.example to .env and provide your Firebase project credentials.'
+    '[Firebase Setup Warning] Firebase environment variables are missing or incomplete. ' +
+    'Check your .env file against .env.example.'
   );
 }
 
-// Initialize Firebase App
+// Initialize Firebase
 const app = initializeApp(firebaseConfig);
 
-// Initialize Firebase Authentication, Cloud Firestore & Cloud Functions
 export const auth = getAuth(app);
 export const db = getFirestore(app);
 export const functions = getFunctions(app);
 
-// Connect to Firebase Emulator Suite if configured
-if (import.meta.env.VITE_USE_FIREBASE_EMULATOR === 'true') {
-  try {
-    connectAuthEmulator(auth, 'http://localhost:9099', { disableWarnings: true });
-    connectFirestoreEmulator(db, 'localhost', 8080);
-    connectFunctionsEmulator(functions, 'localhost', 5001);
-    console.info('[Firebase Emulators] Connected to local Firebase Emulator Suite.');
-  } catch (err) {
-    console.warn('[Firebase Emulators] Failed to connect to emulator:', err);
-  }
+// Connect to local emulators only when explicitly enabled
+const useEmulators =
+  import.meta.env.VITE_USE_FIREBASE_EMULATOR === 'true';
+
+if (useEmulators) {
+  connectAuthEmulator(
+    auth,
+    'http://127.0.0.1:9099',
+    { disableWarnings: true }
+  );
+
+  connectFirestoreEmulator(db, '127.0.0.1', 8080);
+
+  connectFunctionsEmulator(functions, '127.0.0.1', 5001);
+
+  console.info('[Firebase Emulators] Local emulators enabled.');
 }
 
 export default app;
-
