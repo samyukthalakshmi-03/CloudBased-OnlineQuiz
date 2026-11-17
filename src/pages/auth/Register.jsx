@@ -26,7 +26,8 @@ export default function Register() {
     email: '',
     phone: '',
     department: '',
-    password: ''
+    password: '',
+    role: 'student'
   });
 
   const handleChange = (e) => {
@@ -49,6 +50,7 @@ export default function Register() {
     const phone = form.phone.trim();
     const department = form.department;
     const password = form.password;
+    const role = form.role === 'faculty' ? 'faculty' : 'student';
 
     // Required field validation
     if (!name || !email || !phone || !department || !password) {
@@ -94,11 +96,9 @@ export default function Register() {
     setSubmitting(true);
 
     try {
-      // Public registration always creates a student account.
-      // The role is fixed server-side and cannot be chosen here.
-      await register(name, email, password, { phone, department });
+      await register(name, email, password, { phone, department }, role);
 
-      navigate('/student', { replace: true });
+      navigate(role === 'faculty' ? '/faculty' : '/student', { replace: true });
     } catch (err) {
       console.error('Registration error:', err);
       setError(
@@ -127,6 +127,26 @@ export default function Register() {
         </div>
 
         <form onSubmit={handleRegister}>
+          <label>Account Type</label>
+          <div className="auth-role-toggle">
+            <button
+              type="button"
+              className={`auth-role-btn ${form.role === 'student' ? 'active' : ''}`}
+              onClick={() => setForm((f) => ({ ...f, role: 'student' }))}
+            >
+              <UserRound size={18} />
+              Student
+            </button>
+            <button
+              type="button"
+              className={`auth-role-btn ${form.role === 'faculty' ? 'active' : ''}`}
+              onClick={() => setForm((f) => ({ ...f, role: 'faculty' }))}
+            >
+              <GraduationCap size={18} />
+              Faculty
+            </button>
+          </div>
+
           <label>Full Name</label>
           <div className="auth-input">
             <UserRound size={19} />
@@ -235,7 +255,9 @@ export default function Register() {
             className="auth-submit"
             disabled={submitting}
           >
-            {submitting ? 'Creating Account...' : 'Create Student Account'}
+            {submitting
+              ? 'Creating Account...'
+              : `Create ${form.role === 'faculty' ? 'Faculty' : 'Student'} Account`}
           </button>
         </form>
 

@@ -21,20 +21,23 @@ import {
 import { auth, db } from '../firebase/config';
 
 /**
- * Register a new student with Firebase Authentication
+ * Register a new user (student or faculty) with Firebase Authentication
  * and create their profile in Cloud Firestore.
- *
- * Public registration never accepts a role parameter.
- * Faculty accounts must be provisioned through a trusted
- * administrative process.
  *
  * @param {string} name
  * @param {string} email
  * @param {string} password
  * @param {{ phone?: string, department?: string }} [profileExtras]
+ * @param {'student' | 'faculty'} [role='student']
  * @returns {Promise<{uid: string, email: string, name: string, role: string}>}
  */
-export async function registerUser(name, email, password, profileExtras = {}) {
+export async function registerUser(
+  name,
+  email,
+  password,
+  profileExtras = {},
+  role = 'student'
+) {
   if (typeof name !== 'string' || !name.trim()) {
     throw new Error('Name is required.');
   }
@@ -48,6 +51,12 @@ export async function registerUser(name, email, password, profileExtras = {}) {
 
   if (typeof password !== 'string' || password.length < 6) {
     throw new Error('Password must be at least 6 characters.');
+  }
+
+  const allowedRoles = ['student', 'faculty'];
+
+  if (!allowedRoles.includes(role)) {
+    throw new Error('Invalid role.');
   }
 
   let user = null;
@@ -69,7 +78,7 @@ export async function registerUser(name, email, password, profileExtras = {}) {
     const userData = {
       name: name.trim(),
       email: normalizedEmail,
-      role: 'student',
+      role,
       createdAt: serverTimestamp()
     };
 
@@ -95,7 +104,7 @@ export async function registerUser(name, email, password, profileExtras = {}) {
       uid: user.uid,
       email: user.email,
       name: name.trim(),
-      role: 'student',
+      role,
       phone: userData.phone || '',
       department: userData.department || ''
     };

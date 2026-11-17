@@ -218,6 +218,43 @@
   box-shadow: 0 0 0 2px rgba(116, 100, 232, 0.07);
 }
 
+/* REGISTRATION ROLE TOGGLE */
+
+.auth-role-toggle {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 4px 0 4px;
+}
+
+.auth-role-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 14px;
+  border: 1px solid #e8e8f0;
+  border-radius: 9px;
+  background: #ffffff;
+  color: #77778c;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.auth-role-btn:hover {
+  border-color: #7464e8;
+  background: #faf9ff;
+}
+
+.auth-role-btn.active {
+  background: #f0edff;
+  border-color: #7464e8;
+  color: #7464e8;
+  box-shadow: 0 0 0 2px rgba(116, 100, 232, 0.07);
+}
+
 /* ================================
    SUBMIT BUTTON
 ================================ */

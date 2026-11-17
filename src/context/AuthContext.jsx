@@ -85,13 +85,21 @@ export function AuthProvider({ children }) {
     }
   };
 
-  // Public registration always creates a student account.
-  const register = async (name, email, password, profileExtras = {}) => {
+  // Public registration can create either a student or faculty account.
+  // The role cannot be changed after registration (frozen by Firestore rules).
+  const register = async (
+    name,
+    email,
+    password,
+    profileExtras = {},
+    role = 'student'
+  ) => {
     const profile = await registerUser(
       name,
       email,
       password,
-      profileExtras
+      profileExtras,
+      role
     );
 
     setCurrentUser(getCurrentUser());

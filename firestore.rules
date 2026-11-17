@@ -51,12 +51,12 @@ service cloud.firestore {
       // Users can read only their own profiles.
       allow read: if isOwner(userId);
 
-      // Public registration can create student profiles only.
-      // Faculty profiles must be created by trusted
-      // administrative code using Firebase Admin SDK.
+      // Public registration can create student or faculty profiles.
+      // The role is chosen by the user at registration time and
+      // cannot be changed afterwards (frozen on update).
       allow create: if isOwner(userId)
         && request.resource.data.email == request.auth.token.email
-        && request.resource.data.role == 'student'
+        && request.resource.data.role in ['student', 'faculty']
         && request.resource.data.keys().hasAll([
           'email',
           'role'
