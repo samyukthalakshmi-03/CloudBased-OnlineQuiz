@@ -89,6 +89,31 @@ function validateQuizData(quizData) {
   });
 }
 
+function publicationState(quizData) {
+  const raw = typeof quizData.status === 'string' ? quizData.status.trim() : '';
+  const normalized = raw === 'Active' ? 'Published' : raw;
+
+  if (normalized === 'Published' || normalized === 'Draft' || normalized === 'Closed') {
+    return {
+      status: normalized,
+      isPublished: normalized === 'Published'
+    };
+  }
+
+  return {
+    status: quizData.isPublished ? 'Published' : 'Draft',
+    isPublished: Boolean(quizData.isPublished)
+  };
+}
+
+function optionalLabel(value, fallback = '') {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+
+  return value.trim().slice(0, 120);
+}
+
 // Keep correct answers separate from student-visible quiz data.
 function prepareQuizData(quizData, facultyUid) {
   const sanitizedQuestions = quizData.questions.map((q, index) => ({
@@ -104,10 +129,22 @@ function prepareQuizData(quizData, facultyUid) {
     marks: Number(q.marks)
   }));
 
+  const { status, isPublished } = publicationState(quizData);
+
+  const subject = optionalLabel(quizData.subject) || 'General';
+
+  const difficulty = ['Easy', 'Medium', 'Hard'].includes(
+    quizData.difficulty
+  )
+    ? quizData.difficulty
+    : 'Medium';
+
   return {
     quiz: {
       title: quizData.title.trim(),
       description: (quizData.description || '').trim(),
+      subject,
+      difficulty,
       createdBy: facultyUid,
       creatorEmail: auth.currentUser.email || '',
       duration: Number(quizData.duration),
@@ -117,7 +154,8 @@ function prepareQuizData(quizData, facultyUid) {
         (sum, question) => sum + question.marks,
         0
       ),
-      isPublished: Boolean(quizData.isPublished),
+      status,
+      isPublished,
       updatedAt: serverTimestamp()
     },
     answerKey: {

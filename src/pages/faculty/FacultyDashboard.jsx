@@ -1,173 +1,293 @@
-import React, { useState, useEffect } from 'react';
-import { Link } from 'react-router-dom';
-import { getFacultyQuizzes, deleteQuiz, updateQuiz } from '../../services/quizService';
-import { useAuth } from '../../context/AuthContext';
-import LoadingSpinner from '../../components/LoadingSpinner';
+
+import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import {
+  BookOpen,
+  Users,
+  ClipboardList,
+  Award,
+  GraduationCap,
+  PlusCircle,
+} from "lucide-react";
+import { useAuth } from "../../context/AuthContext";
+import { getFacultyQuizzes } from "../../services/quizService";
+import { getQuizResults } from "../../services/resultService";
+
+function normalizeStatus(status) {
+  if (status === "Active") return "Published";
+  return status || "Draft";
+}
 
 export default function FacultyDashboard() {
+  const navigate = useNavigate();
+  const { userProfile } = useAuth();
+
   const [quizzes, setQuizzes] = useState([]);
+  const [resultsByQuiz, setResultsByQuiz] = useState({});
   const [loading, setLoading] = useState(true);
-  const [actionLoading, setActionLoading] = useState(null);
-  const [error, setError] = useState('');
-  const [successMsg, setSuccessMsg] = useState('');
-  const { currentUser } = useAuth();
+  const [error, setError] = useState("");
 
   useEffect(() => {
-    loadQuizzes();
-  }, [currentUser]);
+    if (!userProfile?.uid) return;
 
-  const loadQuizzes = async () => {
-    if (!currentUser) return;
-    try {
-      setLoading(true);
-      setError('');
-      const data = await getFacultyQuizzes(currentUser.uid);
-      setQuizzes(data);
-    } catch (err) {
-      console.error('Error loading faculty quizzes:', err);
-      setError('Failed to fetch your quizzes. Please try refreshing.');
-    } finally {
-      setLoading(false);
-    }
-  };
+    let active = true;
 
-  const handleDelete = async (quizId, quizTitle) => {
-    const confirmed = window.confirm(
-      `Are you sure you want to delete "${quizTitle}"? This will permanently remove the quiz and its answer key.`
-    );
-    if (!confirmed) return;
+    const loadDashboard = async () => {
+      try {
+        setLoading(true);
+        setError("");
 
-    try {
-      setActionLoading(quizId);
-      await deleteQuiz(quizId);
-      setQuizzes(prev => prev.filter(q => q.id !== quizId));
-      setSuccessMsg(`Quiz "${quizTitle}" deleted successfully.`);
-      setTimeout(() => setSuccessMsg(''), 4000);
-    } catch (err) {
-      console.error('Failed to delete quiz:', err);
-      setError(err.message || 'Failed to delete quiz.');
-    } finally {
-      setActionLoading(null);
-    }
-  };
+        const facultyQuizzes = await getFacultyQuizzes(userProfile.uid);
 
-  const handleTogglePublish = async (quiz) => {
-    const newStatus = !quiz.isPublished;
-    try {
-      setActionLoading(quiz.id);
-      await updateQuiz(quiz.id, {
-        ...quiz,
-        isPublished: newStatus
-      });
-      setQuizzes(prev => prev.map(q => q.id === quiz.id ? { ...q, isPublished: newStatus } : q));
-      setSuccessMsg(`Quiz "${quiz.title}" is now ${newStatus ? 'Published' : 'Unpublished (Draft)'}.`);
-      setTimeout(() => setSuccessMsg(''), 4000);
-    } catch (err) {
-      console.error('Failed to toggle publish status:', err);
-      setError('Failed to change publish status.');
-    } finally {
-      setActionLoading(null);
-    }
-  };
+        // Fetch submissions for each quiz to build real performance stats.
+        const resultsEntries = await Promise.all(
+          facultyQuizzes.map(async (quiz) => {
+            try {
+              const quizResults = await getQuizResults(quiz.id);
+              return [quiz.id, quizResults];
+            } catch (err) {
+              console.error(
+                `Failed to load results for quiz ${quiz.id}:`,
+                err
+              );
+              return [quiz.id, []];
+            }
+          })
+        );
 
-  if (loading) {
-    return <LoadingSpinner message="Loading your faculty portal..." />;
-  }
+        if (!active) return;
+
+        setQuizzes(facultyQuizzes);
+        setResultsByQuiz(Object.fromEntries(resultsEntries));
+      } catch (err) {
+        console.error("Error loading faculty dashboard:", err);
+
+        if (active) {
+          setError("Failed to load your dashboard. Please try again.");
+        }
+      } finally {
+        if (active) {
+          setLoading(false);
+        }
+      }
+    };
+
+    loadDashboard();
+
+    return () => {
+      active = false;
+    };
+  }, [userProfile?.uid]);
+
+  const totalQuizzes = quizzes.length;
+
+  const publishedQuizzes = quizzes.filter(
+    (quiz) => normalizeStatus(quiz.status) === "Published"
+  ).length;
+
+  const allResults = Object.values(resultsByQuiz).flat();
+
+  const totalSubmissions = allResults.length;
+
+  const percentages = allResults
+    .map((result) => {
+      const total = Number(result.totalMarks);
+      const score = Number(result.score);
+
+      if (total > 0 && Number.isFinite(score)) {
+        return (score / total) * 100;
+      }
+
+      return null;
+    })
+    .filter((value) => value !== null);
+
+  const averageScore =
+    percentages.length > 0
+      ? Math.round(
+          percentages.reduce((sum, score) => sum + score, 0) /
+            percentages.length
+        )
+      : 0;
+
+  // Get the five most recently created quizzes.
+  const recentQuizzes = [...quizzes]
+    .sort((a, b) => {
+      const dateA = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
+      const dateB = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
+
+      return dateB - dateA;
+    })
+    .slice(0, 5)
+    .map((quiz) => ({
+      ...quiz,
+      submissions: (resultsByQuiz[quiz.id] || []).length,
+      status: normalizeStatus(quiz.status),
+    }));
+
+  const stats = [
+    {
+      title: "Total Quizzes",
+      value: totalQuizzes,
+      icon: BookOpen,
+      color: "purple",
+    },
+    {
+      title: "Published Quizzes",
+      value: publishedQuizzes,
+      icon: Users,
+      color: "blue",
+    },
+    {
+      title: "Total Submissions",
+      value: totalSubmissions,
+      icon: ClipboardList,
+      color: "green",
+    },
+    {
+      title: "Average Score",
+      value: `${averageScore}%`,
+      icon: Award,
+      color: "orange",
+    },
+  ];
+
+  const facultyName = userProfile?.name || "Faculty Member";
+  const facultyInitial = facultyName.charAt(0).toUpperCase();
 
   return (
-    <div className="page-container">
-      <div className="page-header">
+    <>
+      <header className="faculty-header">
         <div>
-          <h1 className="page-title">Faculty Quiz Management</h1>
-          <p className="page-subtitle">
-            Create, publish, edit quizzes, and review student performance analytics.
+          <h1>Faculty Dashboard</h1>
+          <p>Welcome back! Here's your teaching overview.</p>
+        </div>
+
+        <div className="faculty-user">
+          <div className="faculty-avatar">{facultyInitial}</div>
+          <div>
+            <strong>{facultyName}</strong>
+            <span>Faculty</span>
+          </div>
+        </div>
+      </header>
+
+      <section className="faculty-welcome">
+        <div>
+          <span>FACULTY OVERVIEW</span>
+          <h2>Manage your classroom with ease.</h2>
+          <p>
+            Create quizzes, monitor submissions and track student progress.
           </p>
-        </div>
-        <Link to="/faculty/create" className="btn btn-primary">
-          + Create New Quiz
-        </Link>
-      </div>
 
-      {successMsg && (
-        <div className="alert alert-success" role="alert">
-          {successMsg}
+          <button onClick={() => navigate("/faculty/create-quiz")}>
+            <PlusCircle size={18} />
+            Create New Quiz
+          </button>
         </div>
-      )}
 
-      {error && (
-        <div className="alert alert-danger" role="alert">
-          {error}
-        </div>
-      )}
+        <GraduationCap size={90} />
+      </section>
 
-      {quizzes.length === 0 ? (
-        <div className="empty-state">
-          <div className="empty-icon">📂</div>
-          <h3>No Quizzes Created Yet</h3>
-          <p>Get started by creating your first online MCQ quiz with customized questions and duration.</p>
-          <Link to="/faculty/create" className="btn btn-primary">
-            Create Your First Quiz
-          </Link>
-        </div>
-      ) : (
-        <div className="faculty-grid">
-          {quizzes.map((quiz) => (
-            <div key={quiz.id} className="faculty-quiz-card">
-              <div className="card-top-row">
-                <span className={`status-badge ${quiz.isPublished ? 'status-published' : 'status-draft'}`}>
-                  {quiz.isPublished ? '● Published' : '○ Draft'}
-                </span>
-                <span className="quiz-meta-tag">⏱ {quiz.duration} mins</span>
+      <section className="faculty-stats">
+        {stats.map((item) => {
+          const Icon = item.icon;
+
+          return (
+            <div className="faculty-stat-card" key={item.title}>
+              <div className={`faculty-stat-icon ${item.color}`}>
+                <Icon size={23} />
               </div>
 
-              <h3 className="card-title">{quiz.title}</h3>
-              <p className="card-desc">
-                {quiz.description || 'No description provided.'}
-              </p>
-
-              <div className="card-metrics">
-                <div className="metric">
-                  <span className="label">Questions</span>
-                  <span className="val">{quiz.questionCount || quiz.questions?.length || 0}</span>
-                </div>
-                <div className="metric">
-                  <span className="label">Total Marks</span>
-                  <span className="val">{quiz.totalMarks || 0}</span>
-                </div>
-              </div>
-
-              <div className="card-actions-row">
-                <button
-                  onClick={() => handleTogglePublish(quiz)}
-                  className={`btn-sm ${quiz.isPublished ? 'btn-outline-warning' : 'btn-outline-success'}`}
-                  disabled={actionLoading === quiz.id}
-                >
-                  {quiz.isPublished ? 'Unpublish' : 'Publish'}
-                </button>
-                <Link
-                  to={`/faculty/edit/${quiz.id}`}
-                  className="btn-sm btn-secondary"
-                >
-                  Edit
-                </Link>
-                <Link
-                  to={`/faculty/submissions/${quiz.id}`}
-                  className="btn-sm btn-primary"
-                >
-                  Submissions
-                </Link>
-                <button
-                  onClick={() => handleDelete(quiz.id, quiz.title)}
-                  className="btn-sm btn-danger"
-                  disabled={actionLoading === quiz.id}
-                >
-                  {actionLoading === quiz.id ? 'Deleting...' : 'Delete'}
-                </button>
+              <div>
+                <p>{item.title}</p>
+                <h2>{item.value}</h2>
               </div>
             </div>
-          ))}
+          );
+        })}
+      </section>
+
+      <section className="faculty-activity">
+        <div className="faculty-section-heading">
+          <div>
+            <h2>My Recent Quizzes</h2>
+            <p>Recently created quizzes by you</p>
+          </div>
+
+          <button onClick={() => navigate("/faculty/quizzes")}>
+            View All
+          </button>
         </div>
-      )}
-    </div>
+
+        <div className="faculty-table-wrapper">
+          <table className="faculty-table">
+            <thead>
+              <tr>
+                <th>Quiz Name</th>
+                <th>Subject</th>
+                <th>Submissions</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+
+            <tbody>
+              {loading ? (
+                <tr>
+                  <td
+                    colSpan="4"
+                    style={{
+                      textAlign: "center",
+                      padding: "25px",
+                    }}
+                  >
+                    Loading your quizzes...
+                  </td>
+                </tr>
+              ) : error ? (
+                <tr>
+                  <td
+                    colSpan="4"
+                    style={{
+                      textAlign: "center",
+                      padding: "25px",
+                    }}
+                  >
+                    {error}
+                  </td>
+                </tr>
+              ) : recentQuizzes.length > 0 ? (
+                recentQuizzes.map((quiz) => (
+                  <tr key={quiz.id}>
+                    <td>{quiz.title || "Untitled Quiz"}</td>
+                    <td>{quiz.subject || "General"}</td>
+                    <td>{quiz.submissions}</td>
+                    <td>
+                      <span
+                        className={`faculty-status ${quiz.status.toLowerCase()}`}
+                      >
+                        {quiz.status}
+                      </span>
+                    </td>
+                  </tr>
+                ))
+              ) : (
+                <tr>
+                  <td
+                    colSpan="4"
+                    style={{
+                      textAlign: "center",
+                      padding: "25px",
+                    }}
+                  >
+                    No quizzes created by you yet. Create your first quiz!
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </>
   );
 }

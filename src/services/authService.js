@@ -5,13 +5,16 @@ import {
   signOut,
   updateProfile,
   deleteUser,
-  onAuthStateChanged
+  onAuthStateChanged,
+  sendPasswordResetEmail,
+  confirmPasswordReset
 } from 'firebase/auth';
 
 import {
   doc,
   setDoc,
   getDoc,
+  updateDoc,
   serverTimestamp
 } from 'firebase/firestore';
 
@@ -28,9 +31,10 @@ import { auth, db } from '../firebase/config';
  * @param {string} name
  * @param {string} email
  * @param {string} password
+ * @param {{ phone?: string, department?: string }} [profileExtras]
  * @returns {Promise<{uid: string, email: string, name: string, role: string}>}
  */
-export async function registerUser(name, email, password) {
+export async function registerUser(name, email, password, profileExtras = {}) {
   if (typeof name !== 'string' || !name.trim()) {
     throw new Error('Name is required.');
   }
@@ -69,6 +73,21 @@ export async function registerUser(name, email, password) {
       createdAt: serverTimestamp()
     };
 
+    const phone = typeof profileExtras.phone === 'string'
+      ? profileExtras.phone.trim()
+      : '';
+    const department = typeof profileExtras.department === 'string'
+      ? profileExtras.department.trim()
+      : '';
+
+    if (phone) {
+      userData.phone = phone.slice(0, 20);
+    }
+
+    if (department) {
+      userData.department = department.slice(0, 80);
+    }
+
     await setDoc(doc(db, 'users', user.uid), userData);
     profileCreated = true;
 
@@ -76,7 +95,9 @@ export async function registerUser(name, email, password) {
       uid: user.uid,
       email: user.email,
       name: name.trim(),
-      role: 'student'
+      role: 'student',
+      phone: userData.phone || '',
+      department: userData.department || ''
     };
   } catch (error) {
     console.error('[authService.registerUser]', error);
@@ -224,4 +245,82 @@ export async function getUserProfile(uid) {
  */
 export function onAuthChanged(callback) {
   return onAuthStateChanged(auth, callback);
+}
+
+const PROFILE_FIELDS = [
+  'name',
+  'phone',
+  'department',
+  'year',
+  'college',
+  'location'
+];
+
+/**
+ * Update the signed-in user's own profile.
+ * Email and role are never writable from the client.
+ *
+ * @param {Record<string, string>} updates
+ */
+export async function updateUserProfile(updates) {
+  const user = auth.currentUser;
+
+  if (!user) {
+    throw new Error('You must be signed in to update your profile.');
+  }
+
+  const payload = {};
+
+  PROFILE_FIELDS.forEach((field) => {
+    if (typeof updates?.[field] === 'string') {
+      payload[field] = updates[field].trim().slice(0, 120);
+    }
+  });
+
+  if (!payload.name) {
+    throw new Error('Name is required.');
+  }
+
+  await updateDoc(doc(db, 'users', user.uid), payload);
+  await updateProfile(user, { displayName: payload.name });
+
+  return getUserProfile(user.uid);
+}
+
+/**
+ * Send a Firebase password-reset email.
+ * The message does not reveal whether the account exists.
+ *
+ * @param {string} email
+ */
+export async function requestPasswordReset(email) {
+  const normalizedEmail =
+    typeof email === 'string' ? email.trim().toLowerCase() : '';
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    throw new Error('A valid email address is required.');
+  }
+
+  await sendPasswordResetEmail(auth, normalizedEmail, {
+    url: `${window.location.origin}/reset-password`,
+    handleCodeInApp: false
+  });
+}
+
+/**
+ * Complete a password reset using the code from the reset email.
+ *
+ * @param {string} oobCode
+ * @param {string} newPassword
+ */
+export async function completePasswordReset(oobCode, newPassword) {
+  if (typeof oobCode !== 'string' || !oobCode.trim()) {
+    throw new Error('This reset link is missing or invalid.');
+  }
+
+  if (typeof newPassword !== 'string' || newPassword.length < 6) {
+    throw new Error('Password must be at least 6 characters.');
+  }
+
+  await confirmPasswordReset(auth, oobCode.trim(), newPassword);
 }

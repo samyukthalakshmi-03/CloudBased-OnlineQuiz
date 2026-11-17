@@ -1,133 +1,151 @@
 import React from 'react';
-import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
-import { AuthProvider, useAuth } from './context/AuthContext';
-import Navbar from './components/Navbar';
-import ProtectedRoute from './components/ProtectedRoute';
+import {
+  BrowserRouter as Router,
+  Routes,
+  Route,
+  Navigate
+} from 'react-router-dom';
 
-// Pages
-import Login from './pages/Login';
-import Register from './pages/Register';
+import { AuthProvider, useAuth } from './context/AuthContext';
+import ProtectedRoute from './components/ProtectedRoute';
+import LoadingSpinner from './components/LoadingSpinner';
+
+// Authentication Pages
+import Login from './pages/auth/Login';
+import Register from './pages/auth/Register';
+import ForgotPassword from './pages/auth/ForgotPassword';
+import ResetPassword from './pages/auth/ResetPassword';
 import Unauthorized from './pages/Unauthorized';
 
 // Student Pages
 import StudentDashboard from './pages/student/StudentDashboard';
-import QuizAttempt from './pages/student/QuizAttempt';
-import QuizResult from './pages/student/QuizResult';
-import StudentHistory from './pages/student/StudentHistory';
+import AvailableQuizzes from './pages/student/AvailableQuizzes';
+import QuizTaking from './pages/student/QuizTaking';
+import Results from './pages/student/Results';
 import Leaderboard from './pages/student/Leaderboard';
+import Profile from './pages/student/Profile';
 
 // Faculty Pages
+import FacultyLayout from './pages/faculty/FacultyLayout';
 import FacultyDashboard from './pages/faculty/FacultyDashboard';
-import QuizEditor from './pages/faculty/QuizEditor';
-import QuizSubmissions from './pages/faculty/QuizSubmissions';
+import ManageQuizzes from './pages/faculty/ManageQuizzes';
+import CreateQuiz from './pages/faculty/CreateQuiz';
+import Performance from './pages/faculty/Performance';
+import Students from './pages/faculty/Students';
+import FacultyProfile from './pages/faculty/FacultyProfile';
 
 import './App.css';
 
-// Home redirector based on user role
-function HomeRoute() {
-  const { isFaculty } = useAuth();
+// Redirect the home route to the correct dashboard based on the role.
+function HomeRedirect() {
+  const { isFaculty, isStudent, loading } = useAuth();
+
+  if (loading) {
+    return <LoadingSpinner message="Loading your dashboard..." />;
+  }
+
   if (isFaculty) {
     return <Navigate to="/faculty" replace />;
   }
-  return <StudentDashboard />;
+
+  if (isStudent) {
+    return <Navigate to="/student" replace />;
+  }
+
+  return <Navigate to="/login" replace />;
 }
 
 export default function App() {
   return (
     <Router>
       <AuthProvider>
-        <div className="app-layout">
-          <Navbar />
-          <main className="main-content">
-            <Routes>
-              {/* Public Routes */}
-              <Route path="/login" element={<Login />} />
-              <Route path="/register" element={<Register />} />
-              <Route path="/unauthorized" element={<Unauthorized />} />
+        <Routes>
+          {/* Public Routes */}
+          <Route path="/login" element={<Login />} />
+          <Route path="/register" element={<Register />} />
+          <Route path="/forgot-password" element={<ForgotPassword />} />
+          <Route path="/reset-password" element={<ResetPassword />} />
+          <Route path="/unauthorized" element={<Unauthorized />} />
 
-              {/* Shared Protected Home */}
-              <Route
-                path="/"
-                element={
-                  <ProtectedRoute>
-                    <HomeRoute />
-                  </ProtectedRoute>
-                }
-              />
+          {/* Role-aware home redirect */}
+          <Route
+            path="/"
+            element={
+              <ProtectedRoute>
+                <HomeRedirect />
+              </ProtectedRoute>
+            }
+          />
 
-              {/* Student Routes */}
-              <Route
-                path="/student/history"
-                element={
-                  <ProtectedRoute allowedRoles={['student']}>
-                    <StudentHistory />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/quiz/:quizId/attempt"
-                element={
-                  <ProtectedRoute allowedRoles={['student']}>
-                    <QuizAttempt />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/quiz/:quizId/result"
-                element={
-                  <ProtectedRoute>
-                    <QuizResult />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/quiz/:quizId/leaderboard"
-                element={
-                  <ProtectedRoute>
-                    <Leaderboard />
-                  </ProtectedRoute>
-                }
-              />
+          {/* Student Routes */}
+          <Route
+            path="/student"
+            element={
+              <ProtectedRoute allowedRoles={['student']}>
+                <StudentDashboard />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/student/quizzes"
+            element={
+              <ProtectedRoute allowedRoles={['student']}>
+                <AvailableQuizzes />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/student/quiz/:id"
+            element={
+              <ProtectedRoute allowedRoles={['student']}>
+                <QuizTaking />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/student/results"
+            element={
+              <ProtectedRoute allowedRoles={['student']}>
+                <Results />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/student/leaderboard"
+            element={
+              <ProtectedRoute allowedRoles={['student']}>
+                <Leaderboard />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/student/profile"
+            element={
+              <ProtectedRoute allowedRoles={['student']}>
+                <Profile />
+              </ProtectedRoute>
+            }
+          />
 
-              {/* Faculty Routes */}
-              <Route
-                path="/faculty"
-                element={
-                  <ProtectedRoute allowedRoles={['faculty']}>
-                    <FacultyDashboard />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/faculty/create"
-                element={
-                  <ProtectedRoute allowedRoles={['faculty']}>
-                    <QuizEditor />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/faculty/edit/:quizId"
-                element={
-                  <ProtectedRoute allowedRoles={['faculty']}>
-                    <QuizEditor />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/faculty/submissions/:quizId"
-                element={
-                  <ProtectedRoute allowedRoles={['faculty']}>
-                    <QuizSubmissions />
-                  </ProtectedRoute>
-                }
-              />
+          {/* Faculty Routes */}
+          <Route
+            element={
+              <ProtectedRoute allowedRoles={['faculty']}>
+                <FacultyLayout />
+              </ProtectedRoute>
+            }
+          >
+            <Route path="/faculty" element={<FacultyDashboard />} />
+            <Route path="/faculty/quizzes" element={<ManageQuizzes />} />
+            <Route path="/faculty/create-quiz" element={<CreateQuiz />} />
+            <Route path="/faculty/students" element={<Students />} />
+            <Route path="/faculty/performance" element={<Performance />} />
+            <Route path="/faculty/profile" element={<FacultyProfile />} />
+          </Route>
 
-              {/* 404 Catch-All */}
-              <Route path="*" element={<Navigate to="/" replace />} />
-            </Routes>
-          </main>
-        </div>
+          {/* Fallback */}
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
       </AuthProvider>
     </Router>
   );

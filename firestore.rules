@@ -65,7 +65,9 @@ service cloud.firestore {
           'name',
           'email',
           'role',
-          'createdAt'
+          'createdAt',
+          'phone',
+          'department'
         ]);
 
       // Users cannot change their email or role through
@@ -78,7 +80,12 @@ service cloud.firestore {
           .hasOnly([
             'name',
             'displayName',
-            'photoURL'
+            'photoURL',
+            'phone',
+            'department',
+            'year',
+            'college',
+            'location'
           ]);
 
       // Clients cannot delete profiles directly.

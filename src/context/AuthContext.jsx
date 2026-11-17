@@ -78,7 +78,7 @@ export function AuthProvider({ children }) {
       setCurrentUser(user);
       setUserProfile(profile);
 
-      return user;
+      return profile;
     } catch (error) {
       console.error('[AuthContext.login] Profile loading failed:', error);
       throw error;
@@ -86,12 +86,17 @@ export function AuthProvider({ children }) {
   };
 
   // Public registration always creates a student account.
-  const register = async (name, email, password) => {
-    const profile = await registerUser(name, email, password);
-  
+  const register = async (name, email, password, profileExtras = {}) => {
+    const profile = await registerUser(
+      name,
+      email,
+      password,
+      profileExtras
+    );
+
     setCurrentUser(getCurrentUser());
     setUserProfile(profile);
-  
+
     return profile;
   };
 
