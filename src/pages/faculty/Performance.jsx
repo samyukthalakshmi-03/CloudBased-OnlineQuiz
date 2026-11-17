@@ -188,7 +188,7 @@ export default function Performance() {
     };
   }, [userProfile?.uid]);
 
-  if (loading || authLoading) {
+  if (loading) {
     return (
       <LoadingSpinner message="Loading performance analytics..." />
     );

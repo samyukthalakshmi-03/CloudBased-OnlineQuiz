@@ -208,7 +208,7 @@ export default function Students() {
     (student) => student.status === "Active"
   ).length;
 
-  if (loading || authLoading) {
+  if (loading) {
     return <LoadingSpinner message="Loading students..." />;
   }
 
