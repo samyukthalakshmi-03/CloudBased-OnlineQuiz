@@ -11,7 +11,8 @@
     "shell": "firebase functions:shell",
     "start": "npm run shell",
     "deploy": "firebase deploy --only functions",
-    "logs": "firebase functions:log"
+    "logs": "firebase functions:log",
+    "create-faculty": "node scripts/create-faculty.js"
   },
   "dependencies": {
     "firebase-admin": "^14.5.0",
