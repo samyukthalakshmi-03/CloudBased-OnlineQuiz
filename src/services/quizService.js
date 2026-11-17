@@ -4,6 +4,9 @@ import {
   doc,
   getDoc,
   getDocs,
+  setDoc,
+  deleteDoc,
+  updateDoc,
   query,
   where,
   serverTimestamp,
@@ -194,20 +197,29 @@ export async function createQuiz(quizData) {
   const quizRef = doc(collection(db, 'quizzes'));
   const answerRef = doc(db, 'quizAnswers', quizRef.id);
 
-  const batch = writeBatch(db);
-
-  batch.set(quizRef, {
+  // Write the quiz document first. The quizAnswers security rule checks
+  // that the quiz already exists and belongs to the same faculty, so the
+  // two writes cannot be batched together (the rule's get()/exists()
+  // cannot see a sibling write inside the same batch in production).
+  await setDoc(quizRef, {
     ...quiz,
     createdAt: serverTimestamp()
   });
 
-  batch.set(answerRef, {
-    ...answerKey,
-    quizId: quizRef.id
-  });
-
-  // Both documents succeed together or neither is committed.
-  await batch.commit();
+  try {
+    await setDoc(answerRef, {
+      ...answerKey,
+      quizId: quizRef.id
+    });
+  } catch (answerError) {
+    // Roll back the quiz document if the answer key could not be saved.
+    try {
+      await deleteDoc(quizRef);
+    } catch {
+      // Ignore cleanup failure; the quiz doc will be orphaned.
+    }
+    throw answerError;
+  }
 
   return {
     id: quizRef.id,
@@ -246,17 +258,14 @@ export async function updateQuiz(quizId, quizData) {
     currentUser.uid
   );
 
-  const batch = writeBatch(db);
+  // Update the quiz document first, then the answer key. See createQuiz
+  // for why a batched write is not used here.
+  await updateDoc(quizRef, quiz);
 
-  // Do not overwrite original creator or creation timestamp.
-  batch.update(quizRef, quiz);
-
-  batch.set(answerRef, {
+  await setDoc(answerRef, {
     ...answerKey,
     quizId
   });
-
-  await batch.commit();
 }
 
 // ==========================================
